@@ -9,7 +9,8 @@ Two tabs:
   to every e-iris body plus the closed sphere-targeted exposure-match loop.
   Sphere auto-detection is R3DMatch v5's calibrated
   pipeline ported to Swift for live MJPEG frames. The Array tab also includes
-  a write-through Sphere Soak recorder and Log3G10 viewing-transform preflight.
+  a distinct Manual Assist workflow for hand-dialed lenses, a write-through
+  Sphere Soak recorder, and Log3G10 viewing-transform preflight.
 
 **Status: builds with Xcode 16.4** (ad-hoc, unsigned Debug build verified). Nothing here is
 hardware-verified: every aperture, livestream, and transform parameter is
@@ -105,6 +106,16 @@ the deliverable. Only remove a `# UNVERIFIED` marker after recording repeatable
 behavior on supported bodies and firmware.
 
 ## Phase 2 QA additions
+
+The Array tab separates **Electronic** and **Manual Assist** workflows. Manual
+Assist never sends aperture commands: it captures a fixed median, uses the 18%
+gray Log3G10 anchor at 33.3 IRE, or accepts a custom IRE target. It temporarily
+normalizes each mirrored output to Log3G10, then overlays live OPEN / CLOSE /
+HOLD guidance on every camera feed. A camera must hold the
+target tolerance before it is marked matched, and the whole array must verify
+simultaneously. Finish and Abort both restore the display presets captured at
+session start; restoration refuses to overwrite a mirror source or preset that
+an operator changed during the session.
 
 The Array tab's **Soak** card opens a CSV destination and records one row per
 analysis tick, plus structured Exposure Match events. On Stop it writes a

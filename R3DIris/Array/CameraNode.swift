@@ -18,6 +18,9 @@ final class CameraNode: ObservableObject, Identifiable {
     @Published private(set) var waveform: WaveformGrid? = nil
     /// Match-loop bookkeeping, published for the per-camera delta readout.
     @Published var match = NodeMatchInfo()
+    /// Manual Assist bookkeeping. This never drives RCP2 aperture commands;
+    /// it is live operator guidance derived from the sphere measurement.
+    @Published var manualMatch = ManualMatchInfo()
 
     let stream = MJPEGStreamReader()
     private(set) var camera: CameraActor?
@@ -78,6 +81,7 @@ final class CameraNode: ObservableObject, Identifiable {
         tracker.reset()
         sphere = SphereState()
         match = NodeMatchInfo()
+        manualMatch = ManualMatchInfo()
     }
 
     func refresh() {
@@ -220,4 +224,29 @@ struct NodeMatchInfo: Sendable, Equatable {
     /// spill (handoff §7 hybrid). log2 of the IRE ratio — an estimate only;
     /// R3DMatch owns the scene-linear truth.
     var residualStops: Double? = nil
+}
+
+/// Human-in-the-loop iris guidance for a non-electronic lens. Positive
+/// correction means the camera needs more exposure (OPEN); negative means it
+/// needs less (CLOSE). The fixed target belongs to the array session.
+struct ManualMatchInfo: Sendable, Equatable {
+    enum Phase: String, Sendable {
+        case idle = "IDLE"
+        case acquiring = "ACQUIRE"
+        case open = "OPEN"
+        case close = "CLOSE"
+        case hold = "HOLD"
+        case matched = "MATCHED"
+        case unavailable = "NO SIGNAL"
+    }
+
+    var phase: Phase = .idle
+    var baselineIRE: Double? = nil
+    var currentIRE: Double? = nil
+    var targetIRE: Double? = nil
+    var correctionStops: Double? = nil
+    var deltaIRE: Double? = nil
+    /// 0...1 progress through the stability hold once inside tolerance.
+    var stability: Double = 0
+    var detail: String = ""
 }

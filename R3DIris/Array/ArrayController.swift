@@ -49,6 +49,13 @@ final class ArrayController: ObservableObject {
 
     @Published var linkStopText: String = "5.6"
 
+    enum MatchWorkflow: String, CaseIterable, Identifiable {
+        case electronic = "Electronic"
+        case manual = "Manual Assist"
+        var id: String { rawValue }
+    }
+    @Published var matchWorkflow: MatchWorkflow = .electronic
+
     // MARK: Match loop config
 
     enum ReferenceMode: String, CaseIterable, Identifiable {
@@ -71,6 +78,37 @@ final class ArrayController: ObservableObject {
     @Published private(set) var referenceIRE: Double? = nil
     @Published private(set) var loopUsesLog3G10 = false
 
+    // MARK: Manual Assist config + session
+
+    enum ManualTargetMode: String, CaseIterable, Identifiable {
+        case median = "Captured median"
+        case gray18 = "18% gray · 33.3"
+        case custom = "Custom IRE"
+        var id: String { rawValue }
+    }
+
+    enum ManualSessionPhase: String, Equatable {
+        case idle = "idle"
+        case preparing = "preparing"
+        case trimming = "trimming"
+        case complete = "verified"
+        case restoring = "restoring"
+        case finished = "finished"
+        case failed = "failed"
+    }
+
+    @Published var manualTargetMode: ManualTargetMode = .median
+    @Published var manualTargetText: String = String(format: "%.1f", Log3G10.grayAnchorIRE)
+    @Published var manualToleranceStops: Double = 0.10
+    @Published var manualHoldSeconds: Double = 2.0
+    @Published private(set) var manualPhase: ManualSessionPhase = .idle
+    @Published private(set) var manualStatus: String = "Ready to capture a fixed target."
+    @Published private(set) var manualTargetIRE: Double? = nil
+    @Published private(set) var manualParticipantCount = 0
+    @Published private(set) var manualMatchedCount = 0
+    @Published private(set) var manualArraySpreadStops: Double? = nil
+    @Published private(set) var manualCommonDriftStops: Double? = nil
+
     // MARK: Live Sphere Soak
 
     let soak = SoakRecorder()
@@ -79,6 +117,17 @@ final class ArrayController: ObservableObject {
     @Published private(set) var logLines: [BenchLogLine] = []
 
     private var loopTask: Task<Void, Never>?
+    private var manualTask: Task<Void, Never>?
+    private var manualParticipantIDs: Set<UUID> = []
+    private var manualStableSince: [UUID: Date] = [:]
+    private var manualArrayStableSince: Date?
+    private var manualRecentIRE: [UUID: [Double]] = [:]
+    private var manualLastMeasurementAt: [UUID: Date] = [:]
+    private var manualSavedTransforms: [UUID: MonitorTransformReading] = [:]
+    private var manualChangedOutputs: Set<UUID> = []
+    private var manualEndRequested = false
+    private var manualEndMessage = "Manual Assist aborted by operator."
+    private var manualEndWasFailure = false
 
     static let settleTimeout: TimeInterval = 10
     static let measureTimeout: TimeInterval = 6
@@ -155,6 +204,10 @@ final class ArrayController: ObservableObject {
     }
 
     func removeCamera(_ node: CameraNode) {
+        guard !manualSessionActive else {
+            log("remove camera: blocked while Manual Assist owns reversible output state — Finish or Abort first")
+            return
+        }
         node.attachSoakRecorder(nil)
         node.disconnect()
         nodes.removeAll { $0.id == node.id }
@@ -163,17 +216,23 @@ final class ArrayController: ObservableObject {
     }
 
     func connectAll() {
+        guard !manualSessionActive else { return }
         let src = sourceIP.trimmingCharacters(in: .whitespaces)
         for node in nodes { node.connect(sourceIP: src.isEmpty ? nil : src) }
     }
 
     func disconnectAll() {
+        guard !manualSessionActive else {
+            log("disconnect all: blocked while Manual Assist owns reversible output state — Finish or Abort first")
+            return
+        }
         stopMatch()
         if soak.isRecording { stopSoak(reason: "array disconnected") }
         for node in nodes { node.disconnect() }
     }
 
     func streamAll() {
+        guard !manualSessionActive else { return }
         for node in nodes where node.connected && !node.stream.isStreaming {
             node.startStream()
         }
@@ -183,6 +242,7 @@ final class ArrayController: ObservableObject {
     /// operator action for the whole array, one body at a time (serialized so
     /// a wedge is attributable to a specific camera; rule 11).
     func prepareAll() {
+        guard !manualSessionActive else { return }
         Task {
             for node in nodes where node.connected {
                 await node.prepare()
@@ -195,7 +255,7 @@ final class ArrayController: ObservableObject {
     /// One deliberate rule-11 array action. Each body is processed serially so
     /// a bad/unverified parameter remains attributable to one camera session.
     func setLog3G10OnArray() {
-        guard !loopRunning else { return }
+        guard !loopRunning, !manualSessionActive else { return }
         Task {
             let targets = nodes.filter(\.connected)
             guard !targets.isEmpty else {
@@ -212,6 +272,442 @@ final class ArrayController: ObservableObject {
             }
             log("set Log3G10: complete — \(confirmed)/\(targets.count) confirmed")
         }
+    }
+
+    // MARK: - Manual Assist
+
+    var manualSessionActive: Bool {
+        switch manualPhase {
+        case .preparing, .trimming, .complete, .restoring: return true
+        case .idle, .finished, .failed: return false
+        }
+    }
+
+    var workflowBusy: Bool { loopRunning || manualSessionActive }
+
+    var manualParticipants: [CameraNode] {
+        nodes.filter { manualParticipantIDs.contains($0.id) }
+    }
+
+    var manualCustomTargetIRE: Double? {
+        guard let value = Double(manualTargetText.trimmingCharacters(in: .whitespaces)),
+              value > 0, value < 100,
+              Log3G10.linearize(value / 100.0) > 0 else { return nil }
+        return value
+    }
+
+    func isManualParticipant(_ node: CameraNode) -> Bool {
+        manualParticipantIDs.contains(node.id)
+    }
+
+    /// Start a human-in-the-loop match session. Unlike the electronic loop,
+    /// this deliberately ignores APERTURE_CONTROL and never sends APERTURE.
+    /// Every connected + streaming participant must have a trusted sphere lock.
+    func startManualMatch() {
+        guard manualTask == nil, !loopRunning, !manualSessionActive else { return }
+        guard manualTargetMode != .custom || manualCustomTargetIRE != nil else {
+            manualPhase = .failed
+            manualStatus = "Custom target must be a valid Log3G10 IRE between 0 and 100."
+            return
+        }
+
+        matchWorkflow = .manual
+        manualEndRequested = false
+        manualEndWasFailure = false
+        manualEndMessage = "Manual Assist aborted by operator."
+        manualTargetIRE = nil
+        manualParticipantCount = 0
+        manualMatchedCount = 0
+        manualArraySpreadStops = nil
+        manualCommonDriftStops = nil
+        manualParticipantIDs.removeAll()
+        manualStableSince.removeAll()
+        manualArrayStableSince = nil
+        manualRecentIRE.removeAll()
+        manualLastMeasurementAt.removeAll()
+        manualSavedTransforms.removeAll()
+        manualChangedOutputs.removeAll()
+        for node in nodes { node.manualMatch = ManualMatchInfo() }
+
+        manualPhase = .preparing
+        manualStatus = "Checking streams, sphere locks, and mirrored outputs…"
+        manualTask = Task { await runManualMatchSession() }
+    }
+
+    func abortManualMatch() {
+        guard manualTask != nil, manualSessionActive else { return }
+        manualEndWasFailure = false
+        manualEndMessage = "Manual Assist aborted by operator."
+        manualEndRequested = true
+        manualPhase = .restoring
+        manualStatus = "Stopping guidance and restoring saved output presets…"
+        log("manual match: abort requested")
+    }
+
+    func finishManualMatch() {
+        guard manualTask != nil, manualPhase == .complete else { return }
+        manualEndWasFailure = false
+        manualEndMessage = "Manual Assist complete."
+        manualEndRequested = true
+        manualPhase = .restoring
+        manualStatus = "Match verified — restoring saved output presets…"
+        log("manual match: finish requested")
+    }
+
+    private func runManualMatchSession() async {
+        // Disconnected nodes are outside the active array, but every connected
+        // body must stream and lock before capture. Never silently certify a
+        // partial connected array.
+        let parts = nodes.filter(\.connected)
+        guard parts.count >= 2 else {
+            await failManualMatch("Need at least two connected cameras for Manual Assist.")
+            return
+        }
+        let unstreamed = parts.filter { !$0.stream.isStreaming }
+        guard unstreamed.isEmpty else {
+            await failManualMatch("Start the livestream on every connected camera: \(unstreamed.map(\.ip).joined(separator: ", ")).")
+            return
+        }
+        let unlocked = parts.filter { $0.sphere.phase != .locked || $0.sphere.heroIRE == nil }
+        guard unlocked.isEmpty else {
+            await failManualMatch("Sphere lock required on every streaming camera: \(unlocked.map(\.ip).joined(separator: ", ")).")
+            return
+        }
+
+        manualParticipantIDs = Set(parts.map(\.id))
+        manualParticipantCount = parts.count
+        if !manualParticipantIDs.contains(selectedNodeID ?? UUID()) {
+            selectedNodeID = parts.first?.id
+        }
+        for node in parts {
+            node.manualMatch.phase = .acquiring
+            node.manualMatch.detail = "capturing output state"
+        }
+        log("manual match: preparing \(parts.count) camera(s); APERTURE commands disabled")
+
+        // Capture every current output before changing any of them. Unknown
+        // state blocks the transaction so we can always make a safe restore.
+        for node in parts {
+            guard !manualEndRequested else { await closeManualMatch(); return }
+            guard let camera = node.camera else {
+                await failManualMatch("Camera actor unavailable for \(node.ip).")
+                return
+            }
+            let reading = await camera.readActiveMonitorTransform()
+            guard !reading.parameterID.isEmpty, reading.presetValue != nil else {
+                await failManualMatch("Cannot capture the mirrored output preset on \(node.ip); no cameras were intentionally left in an unknown restore state.")
+                return
+            }
+            manualSavedTransforms[node.id] = reading
+        }
+
+        manualStatus = "Temporarily setting the mirrored outputs to Log3G10…"
+        for node in parts {
+            guard !manualEndRequested else { await closeManualMatch(); return }
+            guard let camera = node.camera, let saved = manualSavedTransforms[node.id] else {
+                await failManualMatch("Output transaction lost \(node.ip).")
+                return
+            }
+            guard saved.presetValue != RCP2.log3G10DisplayPresetValue else { continue }
+            // Mark it before the SET: even an unconfirmed SET gets a restore
+            // attempt because the camera may have applied it without replying.
+            manualChangedOutputs.insert(node.id)
+            let ok = await camera.setMonitorDisplayPreset(
+                parameterID: saved.parameterID,
+                value: RCP2.log3G10DisplayPresetValue,
+                reason: "manual match Log3G10")
+            guard ok else {
+                await failManualMatch("Log3G10 readback failed on \(node.ip).")
+                return
+            }
+        }
+
+        guard !manualEndRequested else { await closeManualMatch(); return }
+        manualStatus = "Waiting for post-transform frames…"
+        let freshEpoch = Date()
+        let fresh = await waitFreshMeasurements(parts, after: freshEpoch)
+        guard !manualEndRequested else { await closeManualMatch(); return }
+        guard fresh else {
+            await failManualMatch("Livestream measurements did not refresh after the output change.")
+            return
+        }
+
+        manualStatus = "Capturing stable sphere baselines…"
+        guard let baselines = await captureManualBaselines(parts) else {
+            if manualEndRequested { await closeManualMatch() }
+            else { await failManualMatch("Could not capture stable locked-sphere baselines on every camera.") }
+            return
+        }
+        guard !manualEndRequested else { await closeManualMatch(); return }
+
+        let target: Double
+        switch manualTargetMode {
+        case .median:
+            target = median(Array(baselines.values)) ?? 0
+        case .gray18:
+            target = Log3G10.grayAnchorIRE
+        case .custom:
+            target = manualCustomTargetIRE ?? 0
+        }
+        guard target > 0, Log3G10.linearize(target / 100.0) > 0 else {
+            await failManualMatch("Captured target is outside the usable Log3G10 range.")
+            return
+        }
+
+        manualTargetIRE = target
+        for node in parts {
+            let baseline = baselines[node.id]
+            node.manualMatch = ManualMatchInfo(
+                phase: .acquiring,
+                baselineIRE: baseline,
+                currentIRE: baseline,
+                targetIRE: target,
+                correctionStops: baseline.map { Log3G10.stops(between: target, and: $0) },
+                deltaIRE: baseline.map { $0 - target },
+                stability: 0,
+                detail: "fixed target captured")
+        }
+        manualPhase = .trimming
+        manualStatus = String(format: "Target locked at %.1f IRE — select a camera and trim its lens.", target)
+        log(String(format: "manual match: START — %d cameras, fixed target %.2f IRE, tolerance ±%.3f stop, hold %.1fs",
+                   parts.count, target, manualToleranceStops, manualHoldSeconds))
+        soak.recordMatchEvent("manual_match_start",
+                              detail: String(format: "%d cameras; target %.2f IRE; tolerance %.3f stop",
+                                             parts.count, target, manualToleranceStops))
+
+        while !manualEndRequested {
+            updateManualMatch(parts)
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        await closeManualMatch()
+    }
+
+    /// A short rolling capture makes the fixed baseline resistant to one JPEG
+    /// or detector outlier without pretending the independent streams are
+    /// frame-synchronous.
+    private func captureManualBaselines(_ parts: [CameraNode]) async -> [UUID: Double]? {
+        var samples: [UUID: [Double]] = [:]
+        var lastSeen: [UUID: Date] = [:]
+        let deadline = Date().addingTimeInterval(1.5)
+        while Date() < deadline, !manualEndRequested {
+            for node in parts {
+                guard node.sphere.phase == .locked,
+                      let ire = node.sphere.heroIRE,
+                      let measuredAt = node.sphere.measuredAt,
+                      lastSeen[node.id] != measuredAt else { continue }
+                samples[node.id, default: []].append(ire)
+                lastSeen[node.id] = measuredAt
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard !manualEndRequested,
+              parts.allSatisfy({ (samples[$0.id]?.count ?? 0) >= 2 }) else { return nil }
+
+        var result: [UUID: Double] = [:]
+        for node in parts {
+            guard let values = samples[node.id], let value = median(values) else { return nil }
+            result[node.id] = value
+            manualRecentIRE[node.id] = Array(values.suffix(5))
+            manualLastMeasurementAt[node.id] = lastSeen[node.id]
+        }
+        return result
+    }
+
+    private func updateManualMatch(_ parts: [CameraNode]) {
+        guard let target = manualTargetIRE else { return }
+        let now = Date()
+
+        for node in parts {
+            let measurementFresh: Bool
+            if let measuredAt = node.sphere.measuredAt {
+                measurementFresh = now.timeIntervalSince(measuredAt) <= 1.5
+                if measurementFresh, measuredAt != manualLastMeasurementAt[node.id],
+                   let ire = node.sphere.heroIRE {
+                    var values = manualRecentIRE[node.id, default: []]
+                    values.append(ire)
+                    if values.count > 5 { values.removeFirst(values.count - 5) }
+                    manualRecentIRE[node.id] = values
+                    manualLastMeasurementAt[node.id] = measuredAt
+                }
+            } else {
+                measurementFresh = false
+            }
+
+            guard node.connected, node.stream.isStreaming,
+                  node.sphere.phase == .locked, measurementFresh,
+                  let current = median(manualRecentIRE[node.id] ?? []),
+                  let baseline = node.manualMatch.baselineIRE else {
+                manualStableSince.removeValue(forKey: node.id)
+                node.manualMatch.phase = .unavailable
+                node.manualMatch.stability = 0
+                node.manualMatch.detail = "sphere lock or fresh stream measurement lost"
+                continue
+            }
+
+            let correction = Log3G10.stops(between: target, and: current)
+            guard correction.isFinite else {
+                manualStableSince.removeValue(forKey: node.id)
+                node.manualMatch.phase = .unavailable
+                node.manualMatch.detail = "invalid Log3G10 measurement"
+                continue
+            }
+
+            let wasMatched = node.manualMatch.phase == .matched
+            node.manualMatch.currentIRE = current
+            node.manualMatch.targetIRE = target
+            node.manualMatch.correctionStops = correction
+            node.manualMatch.deltaIRE = current - target
+            node.manualMatch.baselineIRE = baseline
+
+            if abs(correction) <= manualToleranceStops {
+                let since = manualStableSince[node.id] ?? now
+                manualStableSince[node.id] = since
+                let progress = min(1, now.timeIntervalSince(since) / max(0.1, manualHoldSeconds))
+                node.manualMatch.stability = progress
+                node.manualMatch.phase = progress >= 1 ? .matched : .hold
+                node.manualMatch.detail = progress >= 1
+                    ? "stable inside tolerance"
+                    : String(format: "hold steady %.1fs", max(0, manualHoldSeconds - now.timeIntervalSince(since)))
+            } else if wasMatched && abs(correction) <= manualToleranceStops * 1.25 {
+                // Small hysteresis prevents a certified camera flickering at
+                // the exact tolerance boundary; array verification still uses
+                // the strict tolerance below.
+                node.manualMatch.stability = 1
+                node.manualMatch.phase = .matched
+                node.manualMatch.detail = "matched (edge hysteresis)"
+            } else {
+                manualStableSince.removeValue(forKey: node.id)
+                node.manualMatch.stability = 0
+                node.manualMatch.phase = correction > 0 ? .open : .close
+                node.manualMatch.detail = correction > 0
+                    ? String(format: "open iris %.2f stop", abs(correction))
+                    : String(format: "close iris %.2f stop", abs(correction))
+            }
+        }
+
+        manualMatchedCount = parts.filter { $0.manualMatch.phase == .matched }.count
+        let liveIRE = parts.compactMap { $0.manualMatch.currentIRE }.sorted()
+        if let lo = liveIRE.first, let hi = liveIRE.last, liveIRE.count >= 2 {
+            let spread = abs(Log3G10.stops(between: lo, and: hi))
+            manualArraySpreadStops = spread.isFinite ? spread : nil
+        } else {
+            manualArraySpreadStops = nil
+        }
+
+        updateManualDrift(parts)
+        let unavailable = parts.filter { $0.manualMatch.phase == .unavailable }
+        let allStrictlyInside = parts.allSatisfy { node in
+            guard node.manualMatch.phase != .unavailable,
+                  let correction = node.manualMatch.correctionStops else { return false }
+            return abs(correction) <= manualToleranceStops
+        }
+
+        if allStrictlyInside, manualCommonDriftStops == nil {
+            let since = manualArrayStableSince ?? now
+            manualArrayStableSince = since
+            if now.timeIntervalSince(since) >= manualHoldSeconds {
+                if manualPhase != .complete {
+                    manualPhase = .complete
+                    manualStatus = "Array verified simultaneously — Finish & Restore when ready."
+                    log("manual match: VERIFY PASS — every participant held the fixed target")
+                    soak.recordMatchEvent("manual_match_verified",
+                                          finalSpreadStops: manualArraySpreadStops,
+                                          detail: "all cameras inside tolerance")
+                }
+            } else if manualPhase != .complete {
+                manualStatus = String(format: "All cameras in target — hold %.1fs for array verification.",
+                                      max(0, manualHoldSeconds - now.timeIntervalSince(since)))
+            }
+        } else {
+            manualArrayStableSince = nil
+            if manualPhase == .complete {
+                manualPhase = .trimming
+                manualStatus = "Verification reopened — one or more cameras left the target."
+                log("manual match: verification reopened")
+            } else if !unavailable.isEmpty {
+                manualStatus = "SIGNAL LOST — reacquire sphere lock on: \(unavailable.map(\.ip).joined(separator: ", "))."
+            } else if let drift = manualCommonDriftStops {
+                manualStatus = String(format: "GLOBAL LIGHTING DRIFT %+.2f stop — pause trim and inspect the stage.", drift)
+            } else {
+                manualStatus = String(format: "%d/%d matched — trim the selected camera toward the fixed target.",
+                                      manualMatchedCount, manualParticipantCount)
+            }
+        }
+    }
+
+    /// Cameras not selected and not yet in their HOLD/MATCHED gate act as
+    /// independent drift sentinels relative to their own captured baselines.
+    private func updateManualDrift(_ parts: [CameraNode]) {
+        let activeID = selectedNodeID
+        let shifts = parts.compactMap { node -> Double? in
+            guard node.id != activeID,
+                  node.manualMatch.phase == .open || node.manualMatch.phase == .close,
+                  let baseline = node.manualMatch.baselineIRE,
+                  let current = node.manualMatch.currentIRE else { return nil }
+            let shift = Log3G10.stops(between: baseline, and: current)
+            return shift.isFinite ? shift : nil
+        }
+        guard shifts.count >= 2, let common = median(shifts), abs(common) >= 0.15 else {
+            manualCommonDriftStops = nil
+            return
+        }
+        let aligned = shifts.filter {
+            abs($0) >= 0.075 && (($0 > 0) == (common > 0))
+        }.count
+        manualCommonDriftStops = aligned >= max(2, (shifts.count + 1) / 2) ? common : nil
+    }
+
+    private func failManualMatch(_ message: String) async {
+        manualEndWasFailure = true
+        manualEndMessage = message
+        manualEndRequested = true
+        log("manual match: BLOCKED — \(message)")
+        await closeManualMatch()
+    }
+
+    private func closeManualMatch() async {
+        manualPhase = .restoring
+        manualStatus = "Restoring saved output presets…"
+        var restored = 0
+        var failed: [String] = []
+        for node in nodes where manualChangedOutputs.contains(node.id) {
+            guard let camera = node.camera, let saved = manualSavedTransforms[node.id] else {
+                failed.append(node.ip)
+                continue
+            }
+            if await camera.restoreMonitorTransform(saved) {
+                restored += 1
+            } else {
+                failed.append(node.ip)
+            }
+        }
+
+        let changed = manualChangedOutputs.count
+        let restoreText = changed == 0
+            ? "Outputs were already Log3G10."
+            : "Restored \(restored)/\(changed) changed output preset(s)."
+        let failureText = failed.isEmpty ? "" : " Restore requires attention: \(failed.joined(separator: ", "))."
+        manualStatus = "\(manualEndMessage) \(restoreText)\(failureText)"
+        manualPhase = (manualEndWasFailure || !failed.isEmpty) ? .failed : .finished
+        log("manual match: END — \(manualStatus)")
+        soak.recordMatchEvent("manual_match_end",
+                              finalSpreadStops: manualArraySpreadStops,
+                              detail: manualStatus)
+
+        manualSavedTransforms.removeAll()
+        manualChangedOutputs.removeAll()
+        manualEndRequested = false
+        manualEndWasFailure = false
+        manualTask = nil
+    }
+
+    private func median(_ values: [Double]) -> Double? {
+        let sorted = values.sorted()
+        guard !sorted.isEmpty else { return nil }
+        let middle = sorted.count / 2
+        return sorted.count.isMultiple(of: 2)
+            ? (sorted[middle - 1] + sorted[middle]) / 2
+            : sorted[middle]
     }
 
     // MARK: - Live Sphere Soak
@@ -267,6 +763,7 @@ final class ArrayController: ObservableObject {
     /// glass genuinely land on the same T. Copy-to-copy variance is exactly
     /// what the match loop then corrects (handoff §7).
     func pushLinkedStop() {
+        guard !manualSessionActive else { return }
         guard let x10 = linkStopX10 else { return }
         let targets = nodes.filter { $0.connected && $0.eIris }
         guard !targets.isEmpty else {
@@ -292,7 +789,8 @@ final class ArrayController: ObservableObject {
     }
 
     func startMatch() {
-        guard loopTask == nil else { return }
+        guard loopTask == nil, manualTask == nil, !manualSessionActive else { return }
+        matchWorkflow = .electronic
         loopTask = Task { await runMatchLoop() }
     }
 

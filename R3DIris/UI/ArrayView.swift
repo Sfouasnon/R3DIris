@@ -28,8 +28,13 @@ struct ArrayView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         ArrayActionsPanel()
-                        IrisMatchPanel()
-                        MatchLoopPanel()
+                        MatchWorkflowPanel()
+                        if array.matchWorkflow == .electronic {
+                            IrisMatchPanel()
+                            MatchLoopPanel()
+                        } else {
+                            ManualAssistPanel()
+                        }
                         SoakPanel(soak: array.soak)
                         if let node = array.selectedNode {
                             WaveformPanel(node: node)
@@ -229,6 +234,11 @@ struct CameraTile: View {
                         .font(.system(size: 11))
                         .foregroundStyle(Theme.ink3)
                 }
+                if array.matchWorkflow == .manual, array.manualSessionActive,
+                   node.manualMatch.phase != .idle {
+                    ManualCameraHUD(info: node.manualMatch, selected: selected)
+                        .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSm))
+                }
             }
 
             // Identity row
@@ -289,6 +299,7 @@ struct CameraTile: View {
                 .buttonStyle(DarkButtonStyle(destructive: true))
                 .help("Remove from array")
             }
+            .disabled(array.manualSessionActive)
         }
         .padding(8)
         .background(RoundedRectangle(cornerRadius: Theme.radius).fill(Theme.panel))
@@ -394,13 +405,48 @@ struct CameraTile: View {
 
     @ViewBuilder
     var matchChip: some View {
-        if node.match.phase != .idle {
+        if array.matchWorkflow == .manual, array.manualSessionActive,
+           node.manualMatch.phase != .idle {
+            Text(manualMatchLabel)
+                .font(Theme.mono(10, weight: .semibold))
+                .padding(.horizontal, 6).padding(.vertical, 3)
+                .background(Capsule().fill(manualMatchBG))
+                .foregroundStyle(manualMatchInk)
+                .help(node.manualMatch.detail)
+        } else if node.match.phase != .idle {
             Text(matchLabel)
                 .font(Theme.mono(10, weight: .semibold))
                 .padding(.horizontal, 6).padding(.vertical, 3)
                 .background(Capsule().fill(matchBG))
                 .foregroundStyle(matchInk)
                 .help(node.match.note)
+        }
+    }
+
+    var manualMatchLabel: String {
+        guard let correction = node.manualMatch.correctionStops else {
+            return node.manualMatch.phase.rawValue
+        }
+        return String(format: "%@ %.2fst", node.manualMatch.phase.rawValue, abs(correction))
+    }
+
+    var manualMatchBG: Color {
+        switch node.manualMatch.phase {
+        case .matched: return Theme.goodBG
+        case .hold: return Theme.accentBG
+        case .open, .close: return Theme.warnBG
+        case .unavailable: return Theme.dangerBG
+        case .acquiring, .idle: return Theme.idleBG
+        }
+    }
+
+    var manualMatchInk: Color {
+        switch node.manualMatch.phase {
+        case .matched: return Theme.good
+        case .hold: return Theme.accent
+        case .open, .close: return Theme.warn
+        case .unavailable: return Theme.danger
+        case .acquiring, .idle: return Theme.idle
         }
     }
 
@@ -431,6 +477,138 @@ struct CameraTile: View {
         case .capped, .oscillating: return Theme.warn
         case .excluded: return Theme.idle
         case .idle: return .clear
+        }
+    }
+}
+
+/// Live game-like guidance laid over the camera feed. The horizontal marker
+/// is an exposure instruction, not a physical lens-rotation direction:
+/// negative/left = CLOSE, positive/right = OPEN, center = fixed target.
+struct ManualCameraHUD: View {
+    let info: ManualMatchInfo
+    let selected: Bool
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color.black.opacity(0.62), .clear, Color.black.opacity(0.78)],
+                           startPoint: .top, endPoint: .bottom)
+            VStack(spacing: 5) {
+                HStack {
+                    Text("MANUAL TRIM")
+                        .font(.system(size: 8.5, weight: .bold))
+                        .tracking(1.2)
+                        .foregroundStyle(selected ? Theme.accent : Theme.ink2)
+                    Spacer()
+                    if let current = info.currentIRE, let target = info.targetIRE {
+                        Text(String(format: "%.1f → %.1f IRE", current, target))
+                            .font(Theme.mono(9.5, weight: .semibold))
+                            .foregroundStyle(Theme.ink)
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                HStack(spacing: 7) {
+                    Image(systemName: cueIcon)
+                        .font(.system(size: 15, weight: .bold))
+                    Text(info.phase.rawValue)
+                        .font(.system(size: 16, weight: .heavy, design: .rounded))
+                        .tracking(1.4)
+                    if let correction = info.correctionStops,
+                       info.phase == .open || info.phase == .close {
+                        Text(String(format: "%.2f ST", abs(correction)))
+                            .font(Theme.mono(13, weight: .bold))
+                    }
+                }
+                .foregroundStyle(cueColor)
+                .shadow(color: cueColor.opacity(0.45), radius: 5)
+
+                ManualTrimGauge(correctionStops: info.correctionStops,
+                                stability: info.stability,
+                                color: cueColor)
+                    .frame(height: 24)
+            }
+            .padding(9)
+        }
+        .overlay {
+            if selected {
+                RoundedRectangle(cornerRadius: Theme.radiusSm)
+                    .stroke(Theme.accent.opacity(0.75), lineWidth: 1.5)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    var cueIcon: String {
+        switch info.phase {
+        case .open: return "arrow.right"
+        case .close: return "arrow.left"
+        case .hold: return "scope"
+        case .matched: return "checkmark.seal.fill"
+        case .unavailable: return "exclamationmark.triangle.fill"
+        case .acquiring: return "viewfinder"
+        case .idle: return "circle"
+        }
+    }
+
+    var cueColor: Color {
+        switch info.phase {
+        case .matched: return Theme.good
+        case .hold: return Theme.accent
+        case .open, .close: return Theme.warn
+        case .unavailable: return Theme.danger
+        case .acquiring, .idle: return Theme.idle
+        }
+    }
+}
+
+struct ManualTrimGauge: View {
+    let correctionStops: Double?
+    let stability: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let center = width / 2
+            let normalized = min(1, max(-1, correctionStops ?? 0))
+            let markerX = center + CGFloat(normalized) * max(0, center - 8)
+
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.black.opacity(0.55)).frame(height: 8)
+                Capsule().stroke(Theme.line2, lineWidth: 1).frame(height: 8)
+                Rectangle()
+                    .fill(Theme.good.opacity(0.28))
+                    .frame(width: max(8, width * 0.08), height: 12)
+                    .position(x: center, y: geo.size.height / 2)
+                Rectangle()
+                    .fill(Theme.good)
+                    .frame(width: 1.5, height: 18)
+                    .position(x: center, y: geo.size.height / 2)
+                Circle()
+                    .fill(color)
+                    .frame(width: 12, height: 12)
+                    .overlay(Circle().stroke(Color.white.opacity(0.7), lineWidth: 1))
+                    .shadow(color: color.opacity(0.7), radius: 4)
+                    .position(x: markerX, y: geo.size.height / 2)
+                if stability > 0 {
+                    Capsule()
+                        .trim(from: 0, to: min(1, stability))
+                        .stroke(Theme.accent, lineWidth: 2)
+                        .frame(height: 16)
+                }
+                HStack {
+                    Text("CLOSE")
+                    Spacer()
+                    Text("OPEN")
+                }
+                .font(.system(size: 7.5, weight: .bold))
+                .tracking(0.8)
+                .foregroundStyle(Theme.ink3)
+                .offset(y: 13)
+            }
+            .frame(height: 8)
+            .position(x: center, y: 7)
         }
     }
 }
@@ -481,11 +659,333 @@ struct ArrayActionsPanel: View {
                 Button("Disconnect All") { array.disconnectAll() }
                     .buttonStyle(DarkButtonStyle(destructive: true))
             }
-            Button("Prepare — e-iris gate + AE check + subscribe") { array.prepareAll() }
-                .buttonStyle(DarkButtonStyle())
-                .help("Per body: APERTURE_CONTROL gate, AE warning, valid stop list, APERTURE subscription for the settle detector. One deliberate operator action — rule 11.")
+            .disabled(array.manualSessionActive)
+            if array.matchWorkflow == .electronic {
+                Button("Prepare — e-iris gate + AE check + subscribe") { array.prepareAll() }
+                    .buttonStyle(DarkButtonStyle())
+                    .disabled(array.manualSessionActive)
+                    .help("Per body: APERTURE_CONTROL gate, AE warning, valid stop list, APERTURE subscription for the settle detector. One deliberate operator action — rule 11.")
+            } else {
+                Text("Manual Assist uses live sphere measurements only; it does not query, subscribe, or drive APERTURE.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Theme.ink3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .panelCard()
+    }
+}
+
+// MARK: - Match workflow selection
+
+struct MatchWorkflowPanel: View {
+    @EnvironmentObject var array: ArrayController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            GroupHeader(title: "Match Workflow", count: array.matchWorkflow.rawValue)
+            Picker("Workflow", selection: $array.matchWorkflow) {
+                ForEach(ArrayController.MatchWorkflow.allCases) { workflow in
+                    Text(workflow.rawValue).tag(workflow)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(array.workflowBusy)
+
+            Text(array.matchWorkflow == .electronic
+                 ? "Electronic drives supported irises over RCP2 and verifies settle after each move."
+                 : "Manual Assist captures a fixed IRE target and gives live OPEN / CLOSE guidance. It never sends an aperture command.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .panelCard()
+    }
+}
+
+// MARK: - Manual Assist panel
+
+struct ManualAssistPanel: View {
+    @EnvironmentObject var array: ArrayController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            GroupHeader(title: "Manual Assist",
+                        count: manualCount,
+                        warn: array.manualSessionActive,
+                        danger: array.manualPhase == .failed)
+
+            Text("Captures a fixed target from stable sphere measurements, temporarily normalizes mirrored outputs to Log3G10, and restores their saved presets on Finish or Abort.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Picker("Target", selection: $array.manualTargetMode) {
+                ForEach(ArrayController.ManualTargetMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(array.manualSessionActive)
+
+            if array.manualTargetMode == .custom {
+                HStack(spacing: 8) {
+                    Text("Target IRE")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.ink2)
+                    Spacer()
+                    TextField("33.3", text: $array.manualTargetText)
+                        .darkField()
+                        .frame(width: 78)
+                }
+                .disabled(array.manualSessionActive)
+            }
+
+            manualConfigRow("Tolerance", String(format: "±%.2fst", array.manualToleranceStops)) {
+                Slider(value: $array.manualToleranceStops, in: 0.02...0.30, step: 0.01)
+            }
+            manualConfigRow("Stable hold", String(format: "%.1fs", array.manualHoldSeconds)) {
+                Slider(value: $array.manualHoldSeconds, in: 0.5...5.0, step: 0.5)
+            }
+
+            HStack(spacing: 8) {
+                switch array.manualPhase {
+                case .preparing, .trimming:
+                    Button("Abort & Restore") { array.abortManualMatch() }
+                        .buttonStyle(DarkButtonStyle(destructive: true))
+                case .complete:
+                    Button("Finish & Restore") { array.finishManualMatch() }
+                        .buttonStyle(DarkButtonStyle(prominent: true))
+                    Button("Abort") { array.abortManualMatch() }
+                        .buttonStyle(DarkButtonStyle(destructive: true))
+                case .restoring:
+                    ProgressView().controlSize(.small)
+                    Text("Restoring…")
+                        .font(Theme.mono(10.5))
+                        .foregroundStyle(Theme.ink2)
+                case .idle, .finished, .failed:
+                    Button("Capture Target & Start") { array.startManualMatch() }
+                        .buttonStyle(DarkButtonStyle(prominent: true))
+                        .disabled(array.manualTargetMode == .custom && array.manualCustomTargetIRE == nil)
+                }
+                Spacer()
+                Text(array.manualPhase.rawValue.uppercased())
+                    .font(Theme.mono(9.5, weight: .bold))
+                    .foregroundStyle(phaseColor)
+            }
+
+            Text(array.manualStatus)
+                .font(.system(size: 10.5, weight: array.manualCommonDriftStops == nil ? .regular : .semibold))
+                .foregroundStyle(array.manualCommonDriftStops == nil ? Theme.ink2 : Theme.danger)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if array.manualTargetIRE != nil {
+                HStack(spacing: 6) {
+                    manualStat("TARGET", array.manualTargetIRE.map { String(format: "%.1f IRE", $0) } ?? "—")
+                    manualStat("MATCHED", "\(array.manualMatchedCount)/\(array.manualParticipantCount)")
+                    manualStat("SPREAD", array.manualArraySpreadStops.map { String(format: "%.2fst", $0) } ?? "—")
+                }
+            }
+
+            if let drift = array.manualCommonDriftStops {
+                HStack(spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(String(format: "GLOBAL DRIFT %+.2f ST — PAUSE", drift))
+                        .font(Theme.mono(10.5, weight: .bold))
+                }
+                .foregroundStyle(Theme.danger)
+                .padding(8)
+                .frame(maxWidth: .infinity)
+                .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.dangerBG))
+            }
+
+            if let selected = array.selectedNode,
+               array.isManualParticipant(selected) {
+                ManualTrimFocus(node: selected)
+            }
+
+            if !array.manualParticipants.isEmpty {
+                VStack(spacing: 3) {
+                    ForEach(array.manualParticipants) { node in
+                        ManualCameraRow(node: node)
+                    }
+                }
+                .padding(7)
+                .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.panel2))
+            }
+        }
+        .panelCard()
+    }
+
+    var manualCount: String {
+        array.manualParticipantCount == 0
+            ? array.manualPhase.rawValue
+            : "\(array.manualMatchedCount)/\(array.manualParticipantCount)"
+    }
+
+    var phaseColor: Color {
+        switch array.manualPhase {
+        case .complete, .finished: return Theme.good
+        case .failed: return Theme.danger
+        case .preparing, .restoring: return Theme.warn
+        case .trimming: return Theme.accent
+        case .idle: return Theme.idle
+        }
+    }
+
+    @ViewBuilder
+    func manualConfigRow<S: View>(_ label: String, _ value: String,
+                                  @ViewBuilder slider: () -> S) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.ink2)
+                .frame(width: 72, alignment: .leading)
+            slider()
+                .controlSize(.small)
+                .disabled(array.manualSessionActive)
+            Text(value)
+                .font(Theme.mono(10.5))
+                .foregroundStyle(Theme.ink)
+                .frame(width: 62, alignment: .trailing)
+        }
+    }
+
+    func manualStat(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: 7.5, weight: .bold))
+                .tracking(0.8)
+                .foregroundStyle(Theme.ink3)
+            Text(value)
+                .font(Theme.mono(10.5, weight: .semibold))
+                .foregroundStyle(Theme.ink)
+        }
+        .padding(7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 5).fill(Theme.panel2))
+    }
+}
+
+struct ManualTrimFocus: View {
+    @ObservedObject var node: CameraNode
+
+    var info: ManualMatchInfo { node.manualMatch }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text(node.status.name.isEmpty ? node.ip : node.status.name)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(Theme.ink)
+                Spacer()
+                Text("ACTIVE CAMERA")
+                    .font(.system(size: 8, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Theme.accent)
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: cueIcon)
+                    .font(.system(size: 17, weight: .bold))
+                Text(info.phase.rawValue)
+                    .font(.system(size: 20, weight: .heavy, design: .rounded))
+                    .tracking(1.2)
+                Spacer()
+                if let correction = info.correctionStops {
+                    Text(String(format: "%.2f ST", abs(correction)))
+                        .font(Theme.mono(18, weight: .bold))
+                }
+            }
+            .foregroundStyle(cueColor)
+            ManualTrimGauge(correctionStops: info.correctionStops,
+                            stability: info.stability,
+                            color: cueColor)
+                .frame(height: 26)
+            HStack {
+                Text(info.currentIRE.map { String(format: "%.1f IRE", $0) } ?? "—")
+                Spacer()
+                Text(info.targetIRE.map { String(format: "target %.1f", $0) } ?? "target —")
+            }
+            .font(Theme.mono(10.5))
+            .foregroundStyle(Theme.ink2)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.panel3))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusSm).stroke(cueColor.opacity(0.55), lineWidth: 1))
+    }
+
+    var cueIcon: String {
+        switch info.phase {
+        case .open: return "arrow.right"
+        case .close: return "arrow.left"
+        case .hold: return "scope"
+        case .matched: return "checkmark.seal.fill"
+        case .unavailable: return "exclamationmark.triangle.fill"
+        case .acquiring: return "viewfinder"
+        case .idle: return "circle"
+        }
+    }
+
+    var cueColor: Color {
+        switch info.phase {
+        case .matched: return Theme.good
+        case .hold: return Theme.accent
+        case .open, .close: return Theme.warn
+        case .unavailable: return Theme.danger
+        case .acquiring, .idle: return Theme.idle
+        }
+    }
+}
+
+struct ManualCameraRow: View {
+    @EnvironmentObject var array: ArrayController
+    @ObservedObject var node: CameraNode
+
+    var body: some View {
+        Button {
+            array.selectedNodeID = node.id
+        } label: {
+            HStack(spacing: 7) {
+                Circle().fill(stateColor).frame(width: 6, height: 6)
+                Text(node.status.name.isEmpty ? node.ip : node.status.name)
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.ink2)
+                    .lineLimit(1)
+                Spacer()
+                Text(node.manualMatch.currentIRE.map { String(format: "%.1f", $0) } ?? "—")
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.ink3)
+                Text(correctionText)
+                    .font(Theme.mono(10, weight: .bold))
+                    .foregroundStyle(stateColor)
+                    .frame(width: 58, alignment: .trailing)
+                Text(node.manualMatch.phase.rawValue)
+                    .font(.system(size: 8.5, weight: .bold))
+                    .foregroundStyle(stateColor)
+                    .frame(width: 52, alignment: .trailing)
+            }
+            .padding(.horizontal, 5).padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 4)
+                .fill(array.selectedNodeID == node.id ? Theme.accentBG : Color.clear))
+        }
+        .buttonStyle(.plain)
+    }
+
+    var correctionText: String {
+        guard let correction = node.manualMatch.correctionStops else { return "—" }
+        return String(format: "%+.2fst", correction)
+    }
+
+    var stateColor: Color {
+        switch node.manualMatch.phase {
+        case .matched: return Theme.good
+        case .hold: return Theme.accent
+        case .open, .close: return Theme.warn
+        case .unavailable: return Theme.danger
+        case .acquiring, .idle: return Theme.idle
+        }
     }
 }
 

@@ -413,17 +413,34 @@ actor CameraActor {
     /// record-side RWG/Log3G10 metadata/image pipeline.
     func setActiveMonitorLog3G10() async -> Bool {
         let reading = await readActiveMonitorTransform()
-        guard let session, status.link == .connected,
-              !reading.parameterID.isEmpty else {
+        guard status.link == .connected, !reading.parameterID.isEmpty else {
             log("set Log3G10: REFUSED — active livestream mirror output is unknown")
             return false
         }
-        let pid = reading.parameterID
-        log("rcp_set \(pid) \(RCP2.log3G10DisplayPresetValue) (LOG3G10; output-side, # UNVERIFIED)")
+        return await setMonitorDisplayPreset(parameterID: reading.parameterID,
+                                             value: RCP2.log3G10DisplayPresetValue,
+                                             reason: "set Log3G10")
+    }
+
+    /// Set one known monitor-output preset and verify its readback. This is
+    /// shared by the explicit Log3G10 action and Manual Assist's reversible
+    /// output transaction; it never touches record-side color/gamma settings.
+    func setMonitorDisplayPreset(parameterID pid: String, value: Int,
+                                 reason: String) async -> Bool {
+        guard RCP2.monitorDisplayPresetParams.contains(pid) else {
+            log("\(reason): REFUSED — \(pid) is not a monitor display-preset parameter")
+            return false
+        }
+        guard let session, status.link == .connected else {
+            log("\(reason): REFUSED — camera session is not connected")
+            return false
+        }
+        let label = RCP2.displayPresetLabels[value] ?? "PRESET \(value)"
+        log("rcp_set \(pid) \(value) (\(label); output-side, # UNVERIFIED)")
         do {
             try await session.send([
                 "type": "rcp_set", "id": pid,
-                "value": RCP2.log3G10DisplayPresetValue,
+                "value": value,
             ])
         } catch {
             status.lastError = String(describing: error)
@@ -436,15 +453,42 @@ actor CameraActor {
         // one-off unsubscribe discipline for the verification read (rule 10).
         unsubscribed.remove(pid)
         let verify = await benchGet(pid)
-        let confirmed = RCP2.extractInt(verify) == RCP2.log3G10DisplayPresetValue
+        let confirmed = RCP2.extractInt(verify) == value
         if confirmed {
             status.monitorTransformParam = pid
-            status.monitorTransformValue = RCP2.log3G10DisplayPresetValue
+            status.monitorTransformValue = value
             status.monitorTransformSeenAt = Date()
             publish()
         }
-        log("set Log3G10: \(confirmed ? "CONFIRMED" : "NOT CONFIRMED") on \(pid)")
+        log("\(reason): \(confirmed ? "CONFIRMED" : "NOT CONFIRMED") on \(pid) = \(value) (\(label))")
         return confirmed
+    }
+
+    /// Restore a display preset captured before Manual Assist. Restoration is
+    /// deliberately conservative: if the mirrored output changed, or an
+    /// operator selected a third preset during the session, do not overwrite
+    /// that newer choice.
+    func restoreMonitorTransform(_ saved: MonitorTransformReading) async -> Bool {
+        guard let savedValue = saved.presetValue, !saved.parameterID.isEmpty else {
+            log("restore monitor transform: REFUSED — saved preset is incomplete")
+            return false
+        }
+        let current = await readActiveMonitorTransform()
+        guard current.parameterID == saved.parameterID else {
+            log("restore monitor transform: REFUSED — livestream mirror output changed (saved \(saved.parameterID), active \(current.parameterID.isEmpty ? "unknown" : current.parameterID))")
+            return false
+        }
+        if current.presetValue == savedValue {
+            log("restore monitor transform: already at saved preset \(savedValue) on \(saved.parameterID)")
+            return true
+        }
+        guard current.presetValue == RCP2.log3G10DisplayPresetValue else {
+            log("restore monitor transform: REFUSED — active preset changed during Manual Assist")
+            return false
+        }
+        return await setMonitorDisplayPreset(parameterID: saved.parameterID,
+                                             value: savedValue,
+                                             reason: "restore monitor transform")
     }
 
     // MARK: - Receive path
