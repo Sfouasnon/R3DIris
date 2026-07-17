@@ -11,6 +11,16 @@ struct ArrayView: View {
     @EnvironmentObject var array: ArrayController
 
     var body: some View {
+        ZStack {
+            arrayContent
+            if let fs = array.fullScreenNode {
+                FullscreenCameraView(node: fs)
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    var arrayContent: some View {
         VStack(spacing: 0) {
             DiscoveryBar()
             if !array.discovered.isEmpty {
@@ -58,11 +68,13 @@ struct DiscoveryBar: View {
     var body: some View {
         HStack(spacing: 10) {
             // Discovery cluster — the primary way cameras enter the array.
-            TextField("subnet / CIDR (172.20.114.0/24)", text: $array.subnet)
+            // Empty = auto-detect this Mac's subnets; typing overrides.
+            TextField("subnet (auto)", text: $array.subnet)
                 .darkField()
-                .frame(width: 200)
+                .frame(width: 150)
                 .onSubmit { array.discover() }
                 .disabled(array.discovering)
+                .help("Leave empty: Detect Cameras sweeps the subnets of this Mac's own network interfaces. Enter a CIDR only to override (routed arrays, unusual topologies).")
             TextField("source IP (rule 16)", text: $array.sourceIP)
                 .darkField()
                 .frame(width: 140)
@@ -114,7 +126,7 @@ struct DiscoveryBar: View {
         let n = array.subnetHostCount
         return n > 0
             ? "TCP sweep of \(n) host(s) on :9998 (no session-slot cost), CAMINFO broadcast fallback."
-            : "No subnet set — CAMINFO broadcast only. Enter a subnet/CIDR to enable the TCP sweep."
+            : "Auto: sweeps this Mac's own subnet(s) on :9998, CAMINFO broadcast fallback. Type a CIDR to override."
     }
 }
 
@@ -306,7 +318,12 @@ struct CameraTile: View {
         .overlay(RoundedRectangle(cornerRadius: Theme.radius)
             .stroke(selected ? Theme.accent : Theme.line, lineWidth: selected ? 2 : 1))
         .contentShape(Rectangle())
-        .onTapGesture { array.selectedNodeID = node.id }
+        .gesture(TapGesture(count: 2).onEnded {
+            array.selectedNodeID = node.id
+            array.fullScreenNodeID = node.id
+        })
+        .simultaneousGesture(TapGesture().onEnded { array.selectedNodeID = node.id })
+        .help("Click: select · double-click: full screen")
     }
 
     var linkLevel: StatusDot.Level {
@@ -484,23 +501,184 @@ struct CameraTile: View {
 /// Live game-like guidance laid over the camera feed. The horizontal marker
 /// is an exposure instruction, not a physical lens-rotation direction:
 /// negative/left = CLOSE, positive/right = OPEN, center = fixed target.
+// MARK: - Manual trim HUD kit
+//
+// Game-style operator guidance for hand-trimming an iris ring: marching
+// chevrons show WHICH WAY and HOW FAR (1–3 by magnitude), a center-zero
+// gauge with quarter-stop ticks shows position, the capture band is sized
+// by the REAL session tolerance, and a hold-to-confirm ring fills while the
+// reading stays inside the band. Clean, technical, no clutter — the cues
+// are the interface.
+
+/// Shared cue phase → color/icon mapping so tile HUD and focus card agree.
+enum ManualCueStyle {
+    static func icon(_ phase: ManualMatchInfo.Phase) -> String {
+        switch phase {
+        case .open: return "plus.circle"
+        case .close: return "minus.circle"
+        case .hold: return "target"
+        case .matched: return "checkmark.circle.fill"
+        case .unavailable: return "exclamationmark.triangle.fill"
+        case .acquiring: return "viewfinder"
+        case .idle: return "circle.dashed"
+        }
+    }
+
+    static func color(_ phase: ManualMatchInfo.Phase) -> Color {
+        switch phase {
+        case .matched: return Theme.good
+        case .hold: return Theme.accent
+        case .open, .close: return Theme.warn
+        case .unavailable: return Theme.danger
+        case .acquiring, .idle: return Theme.idle
+        }
+    }
+}
+
+/// 1–3 chevrons by correction magnitude, marching in the trim direction.
+/// `direction` +1 = open (right), −1 = close (left). Static when inactive.
+struct TrimChevrons: View {
+    let direction: Double
+    let magnitudeStops: Double
+    let color: Color
+
+    private var count: Int {
+        let m = abs(magnitudeStops)
+        return m >= 0.75 ? 3 : m >= 0.25 ? 2 : 1
+    }
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let phase = (t * 2.2).truncatingRemainder(dividingBy: 1.0)
+            HStack(spacing: 2) {
+                ForEach(0..<3, id: \.self) { i in
+                    let order = direction >= 0 ? i : (2 - i)
+                    let active = order < count
+                    // Stagger the pulse along the march direction.
+                    let local = (phase - Double(order) * 0.22)
+                        .truncatingRemainder(dividingBy: 1.0)
+                    let pulse = local >= 0 && local < 0.45 ? 1.0 : 0.35
+                    Image(systemName: direction >= 0 ? "chevron.right" : "chevron.left")
+                        .font(.system(size: 11, weight: .heavy))
+                        .foregroundStyle(color.opacity(active ? pulse : 0.12))
+                }
+            }
+        }
+        .frame(width: 34)
+    }
+}
+
+/// Hold-to-confirm ring: fills with `stability` while inside tolerance;
+/// full + solid on matched. The "capture" affordance.
+struct HoldRing: View {
+    let phase: ManualMatchInfo.Phase
+    let stability: Double
+    var size: CGFloat = 24
+
+    private var color: Color { ManualCueStyle.color(phase) }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Theme.line2, lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: phase == .matched ? 1 : min(1, max(0, stability)))
+                .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .animation(.linear(duration: 0.2), value: stability)
+            Image(systemName: ManualCueStyle.icon(phase))
+                .font(.system(size: size * 0.42, weight: .bold))
+                .foregroundStyle(color)
+        }
+        .frame(width: size, height: size)
+        .shadow(color: phase == .matched ? color.opacity(0.6) : .clear, radius: 4)
+    }
+}
+
+/// Center-zero trim gauge, ±1 stop full scale: quarter-stop ticks, a capture
+/// band sized by the session tolerance, and a spring-animated needle.
+struct ManualTrimGauge: View {
+    let correctionStops: Double?
+    let toleranceStops: Double
+    let color: Color
+    var compact = false
+
+    private static let fullScaleStops = 1.0
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let barH: CGFloat = compact ? 6 : 8
+            let midY = geo.size.height / 2
+            let usable = w - 12
+            let value = min(Self.fullScaleStops, max(-Self.fullScaleStops, correctionStops ?? 0))
+            let needleX = w / 2 + usable / 2 * CGFloat(value / Self.fullScaleStops)
+            let bandW = max(6, usable * CGFloat(min(1, toleranceStops / Self.fullScaleStops)))
+
+            ZStack {
+                // Track
+                Capsule()
+                    .fill(Color.black.opacity(0.5))
+                    .frame(width: usable + 12, height: barH)
+                    .position(x: w / 2, y: midY)
+                // Quarter-stop ticks
+                ForEach(-4...4, id: \.self) { q in
+                    let major = q == 0
+                    Rectangle()
+                        .fill(major ? Theme.ink2 : Theme.line2)
+                        .frame(width: 1, height: major ? barH + 8 : barH + 3)
+                        .position(x: w / 2 + usable / 2 * CGFloat(Double(q) / 4.0), y: midY)
+                }
+                // Capture band = real tolerance
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Theme.good.opacity(0.30))
+                    .overlay(RoundedRectangle(cornerRadius: 2).stroke(Theme.good.opacity(0.6), lineWidth: 1))
+                    .frame(width: bandW, height: barH + 6)
+                    .position(x: w / 2, y: midY)
+                // Needle
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(color)
+                    .frame(width: 3, height: barH + 12)
+                    .shadow(color: color.opacity(0.8), radius: 4)
+                    .position(x: needleX, y: midY)
+                    .animation(.spring(response: 0.35, dampingFraction: 0.8), value: needleX)
+                // End labels
+                if !compact {
+                    Text("CLOSE")
+                        .font(.system(size: 7, weight: .bold)).tracking(0.8)
+                        .foregroundStyle(Theme.ink3)
+                        .position(x: 18, y: midY + barH + 9)
+                    Text("OPEN")
+                        .font(.system(size: 7, weight: .bold)).tracking(0.8)
+                        .foregroundStyle(Theme.ink3)
+                        .position(x: w - 18, y: midY + barH + 9)
+                }
+            }
+        }
+    }
+}
+
 struct ManualCameraHUD: View {
     let info: ManualMatchInfo
     let selected: Bool
 
+    private var cueColor: Color { ManualCueStyle.color(info.phase) }
+    private var trimming: Bool { info.phase == .open || info.phase == .close }
+
     var body: some View {
         ZStack {
-            LinearGradient(colors: [Color.black.opacity(0.62), .clear, Color.black.opacity(0.78)],
+            LinearGradient(colors: [Color.black.opacity(0.55), .clear, Color.black.opacity(0.72)],
                            startPoint: .top, endPoint: .bottom)
-            VStack(spacing: 5) {
+            VStack(spacing: 4) {
                 HStack {
                     Text("MANUAL TRIM")
                         .font(.system(size: 8.5, weight: .bold))
-                        .tracking(1.2)
+                        .tracking(1.6)
                         .foregroundStyle(selected ? Theme.accent : Theme.ink2)
                     Spacer()
                     if let current = info.currentIRE, let target = info.targetIRE {
-                        Text(String(format: "%.1f → %.1f IRE", current, target))
+                        Text(String(format: "%.1f → %.1f", current, target))
                             .font(Theme.mono(9.5, weight: .semibold))
                             .foregroundStyle(Theme.ink)
                     }
@@ -508,25 +686,33 @@ struct ManualCameraHUD: View {
 
                 Spacer(minLength: 0)
 
-                HStack(spacing: 7) {
-                    Image(systemName: cueIcon)
-                        .font(.system(size: 15, weight: .bold))
-                    Text(info.phase.rawValue)
-                        .font(.system(size: 16, weight: .heavy, design: .rounded))
-                        .tracking(1.4)
-                    if let correction = info.correctionStops,
-                       info.phase == .open || info.phase == .close {
-                        Text(String(format: "%.2f ST", abs(correction)))
-                            .font(Theme.mono(13, weight: .bold))
+                // Cue line: phase + signed correction, hold ring at right.
+                HStack(spacing: 8) {
+                    if trimming {
+                        TrimChevrons(direction: info.phase == .open ? 1 : -1,
+                                     magnitudeStops: info.correctionStops ?? 0,
+                                     color: cueColor)
                     }
+                    Text(info.phase.rawValue)
+                        .font(.system(size: 15, weight: .heavy, design: .rounded))
+                        .tracking(1.6)
+                        .foregroundStyle(cueColor)
+                    if let correction = info.correctionStops, trimming {
+                        Text(String(format: "%+.2f ST", correction))
+                            .font(Theme.mono(12, weight: .bold))
+                            .foregroundStyle(cueColor)
+                            .help("Signed iris move: + open, − close")
+                    }
+                    Spacer()
+                    HoldRing(phase: info.phase, stability: info.stability, size: 22)
                 }
-                .foregroundStyle(cueColor)
-                .shadow(color: cueColor.opacity(0.45), radius: 5)
+                .shadow(color: cueColor.opacity(0.35), radius: 4)
 
-                ManualTrimGauge(correctionStops: info.correctionStops,
-                                stability: info.stability,
-                                color: cueColor)
-                    .frame(height: 24)
+                ManualTrimGauge(correctionStops: info.correctionStops.map { -$0 },
+                                toleranceStops: info.toleranceStops,
+                                color: cueColor,
+                                compact: true)
+                    .frame(height: 18)
             }
             .padding(9)
         }
@@ -538,78 +724,351 @@ struct ManualCameraHUD: View {
         }
         .allowsHitTesting(false)
     }
+}
 
-    var cueIcon: String {
-        switch info.phase {
-        case .open: return "arrow.right"
-        case .close: return "arrow.left"
-        case .hold: return "scope"
-        case .matched: return "checkmark.seal.fill"
-        case .unavailable: return "exclamationmark.triangle.fill"
-        case .acquiring: return "viewfinder"
-        case .idle: return "circle"
+// MARK: - Fullscreen camera view (double-click a tile; Esc / double-click exits)
+
+struct FullscreenCameraView: View {
+    @EnvironmentObject var array: ArrayController
+    @ObservedObject var node: CameraNode
+    @ObservedObject var stream: MJPEGStreamReader
+
+    init(node: CameraNode) {
+        self.node = node
+        self.stream = node.stream
+    }
+
+    private var manualActive: Bool {
+        array.manualSessionActive && array.isManualParticipant(node)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let frame = stream.frame {
+                Image(decorative: frame, scale: 1.0)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .overlay {
+                        // Manual trimming: the dial ring replaces the plain
+                        // lock circle so the sphere stays fully visible.
+                        if manualActive {
+                            IrisDialOverlay(sphere: node.sphere, info: node.manualMatch)
+                        } else {
+                            SphereOverlay(sphere: node.sphere)
+                        }
+                    }
+            } else {
+                Text(stream.isStreaming ? "waiting for frames…" : "no stream")
+                    .font(.system(size: 15))
+                    .foregroundStyle(Theme.ink3)
+            }
+
+            if manualActive {
+                BigIREReadouts(info: node.manualMatch)
+            }
+
+            VStack {
+                // Header strip
+                HStack(spacing: 10) {
+                    StatusDot(level: node.connected ? .ok : .off)
+                    Text(node.status.name.isEmpty ? node.ip : node.status.name)
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(Theme.ink)
+                    Text(node.ip)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.ink3)
+                    Text("T \(RCP2.stopLabel(node.status.apertureCur))")
+                        .font(Theme.mono(13, weight: .semibold))
+                        .foregroundStyle(Theme.ink2)
+                    if let ire = node.sphere.heroIRE {
+                        Text(String(format: "%.1f IRE", ire))
+                            .font(Theme.mono(13, weight: .semibold))
+                            .foregroundStyle(Theme.accent)
+                    }
+                    Spacer()
+                    Button {
+                        array.fullScreenNodeID = nil
+                    } label: {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                    .buttonStyle(DarkButtonStyle())
+                    .help("Exit full screen (Esc or double-click)")
+                }
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .background(LinearGradient(colors: [Color.black.opacity(0.7), .clear],
+                                           startPoint: .top, endPoint: .bottom))
+                Spacer()
+            }
+        }
+        .contentShape(Rectangle())
+        .gesture(TapGesture(count: 2).onEnded { array.fullScreenNodeID = nil })
+        .onExitCommand { array.fullScreenNodeID = nil }
+    }
+}
+
+// MARK: - Sphere-centric trim dial (fullscreen manual mode)
+//
+// The dial lives AROUND the detected sphere, so the target stays fully
+// visible while trimming — designed for a laptop mirrored to an on-set
+// monitor, read from the camera position:
+//   · an amber arc winds out from 12 o'clock in the DIAL DIRECTION —
+//     clockwise/right = OPEN, counter-clockwise/left = CLOSE; its length is
+//     the remaining correction (±1 stop full scale). Trim the ring and the
+//     arc slowly winds back to zero.
+//   · a green notch at 12 o'clock is the capture band, sized by the REAL
+//     session tolerance; inside it the dial turns teal and the notch fills
+//     as the hold-to-confirm progresses; solid green ring = matched.
+//   · chevrons march just ahead of the arc tip, pointing the way to turn.
+// Numerals live at the screen edges (BigIREReadouts) — nothing sits on
+// the sphere.
+
+struct IrisDialOverlay: View {
+    let sphere: SphereState
+    let info: ManualMatchInfo
+
+    static let fullScaleStops = 1.0
+    static let maxSweepDeg = 130.0
+
+    private var cueColor: Color { ManualCueStyle.color(info.phase) }
+    private var opening: Bool { (info.correctionStops ?? 0) > 0 }
+
+    var body: some View {
+        GeometryReader { geo in
+            if sphere.hasROI {
+                let cx = sphere.cx * geo.size.width
+                let cy = sphere.cy * geo.size.height
+                let sphereR = sphere.r * geo.size.width
+                // Well clear of the sphere: the dial is instrumentation, the
+                // sphere is the subject — they should never read as one shape.
+                let ringR = min(max(sphereR * 2.4, 120),
+                                min(geo.size.width, geo.size.height) * 0.46)
+                dial(radius: ringR, sphereR: sphereR)
+                    .position(x: cx, y: cy)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func dial(radius: CGFloat, sphereR: CGFloat) -> some View {
+        // Read-from-12-feet geometry: the ring is a signal lamp first and an
+        // instrument second — the assistant has hands on the camera and the
+        // monitor across the volume. Thick main track, tick scale outside,
+        // segmented idle ring hugging the sphere inside.
+        let ringW = max(20, radius * 0.15)
+        let tickR = radius + ringW * 1.15
+        let corr = info.correctionStops ?? 0
+        let sweepFrac = min(1, abs(corr) / Self.fullScaleStops) * Self.maxSweepDeg / 360.0
+        let notchHalfFrac = min(0.5, (info.toleranceStops / Self.fullScaleStops))
+            * Self.maxSweepDeg / 360.0
+        let matched = info.phase == .matched
+        let holding = info.phase == .hold
+        let trackFrac = Self.maxSweepDeg * 2 / 360.0
+
+        ZStack {
+            // Faint thick track — the visible ±1-stop scale
+            Circle()
+                .trim(from: 0, to: trackFrac)
+                .stroke(Color.white.opacity(0.13),
+                        style: StrokeStyle(lineWidth: ringW, lineCap: .round))
+                .rotationEffect(.degrees(-90 - Self.maxSweepDeg))
+
+            // Tick scale: minors every 1/16 stop, majors each 1/4 stop
+            ForEach(-16...16, id: \.self) { q in
+                let major = q % 4 == 0
+                let angDeg = -90.0 + Double(q) / 16.0 * Self.maxSweepDeg
+                Rectangle()
+                    .fill(Color.white.opacity(major ? 0.55 : 0.22))
+                    .frame(width: major ? 2.5 : 1, height: major ? 14 : 7)
+                    .offset(y: -(tickR + (major ? 7 : 3.5)))
+                    .rotationEffect(.degrees(angDeg + 90))
+            }
+            // Stop labels at the scale ends and halves
+            ForEach([-1.0, -0.5, 0.5, 1.0], id: \.self) { stops in
+                let ang = (-90.0 + stops * Self.maxSweepDeg) * .pi / 180
+                Text(abs(stops) == 1 ? "1.0" : ".5")
+                    .font(Theme.mono(11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.4))
+                    .offset(x: (tickR + 30) * cos(ang), y: (tickR + 30) * sin(ang))
+            }
+
+            // Segmented inner ring hugging the sphere — slow idle rotation
+            dialInnerRing(radius: min(sphereR * 1.22, radius - ringW), matched: matched)
+
+            // Capture notch at 12 o'clock (± tolerance)
+            Circle()
+                .trim(from: 0, to: notchHalfFrac * 2)
+                .stroke(Theme.good.opacity(matched ? 1 : 0.65),
+                        style: StrokeStyle(lineWidth: ringW, lineCap: .round))
+                .rotationEffect(.degrees(-90 - notchHalfFrac * 360))
+                .shadow(color: Theme.good.opacity(0.5), radius: 8)
+
+            // Hold-to-confirm: the notch fills with teal as stability builds
+            if holding || matched {
+                Circle()
+                    .trim(from: 0, to: notchHalfFrac * 2 * (matched ? 1 : min(1, info.stability)))
+                    .stroke(Theme.accent,
+                            style: StrokeStyle(lineWidth: ringW, lineCap: .round))
+                    .rotationEffect(.degrees(-90 - notchHalfFrac * 360))
+                    .shadow(color: Theme.accent.opacity(0.7), radius: 9)
+                    .animation(.linear(duration: 0.2), value: info.stability)
+            }
+
+            // Matched: the whole ring lights green
+            if matched {
+                Circle()
+                    .stroke(Theme.good.opacity(0.92), lineWidth: ringW * 0.55)
+                    .shadow(color: Theme.good.opacity(0.6), radius: 12)
+            }
+
+            // Correction arc — thick, glowing, winds out in the dial
+            // direction and back to zero as the operator trims.
+            if info.phase == .open || info.phase == .close {
+                // Glow underlay
+                Circle()
+                    .trim(from: 0, to: sweepFrac)
+                    .stroke(cueColor.opacity(0.35),
+                            style: StrokeStyle(lineWidth: ringW * 1.9, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .scaleEffect(x: opening ? 1 : -1, y: 1)
+                    .blur(radius: 6)
+                // Core
+                Circle()
+                    .trim(from: 0, to: sweepFrac)
+                    .stroke(cueColor,
+                            style: StrokeStyle(lineWidth: ringW, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .scaleEffect(x: opening ? 1 : -1, y: 1)
+                    .animation(.easeOut(duration: 0.45), value: sweepFrac)
+                // Bright tip cap
+                dialTipCap(radius: radius, sweepFrac: sweepFrac, ringW: ringW)
+
+                dialChevrons(radius: radius, sweepFrac: sweepFrac, ringW: ringW)
+                dialDeltaChip(radius: radius, sweepFrac: sweepFrac, ringW: ringW, corr: corr)
+            }
+
+            // Phase word above the tick scale — readable across the volume
+            Text(info.phase.rawValue)
+                .font(.system(size: 24, weight: .heavy, design: .rounded))
+                .tracking(3.5)
+                .foregroundStyle(cueColor)
+                .shadow(color: .black.opacity(0.85), radius: 3)
+                .offset(y: -tickR - 46)
+        }
+        .frame(width: radius * 2, height: radius * 2)
+    }
+
+    private func dialTipCap(radius: CGFloat, sweepFrac: Double, ringW: CGFloat) -> some View {
+        let dir: Double = opening ? 1 : -1
+        let ang = (-90.0 + dir * sweepFrac * 360.0) * .pi / 180
+        return Circle()
+            .fill(Color.white.opacity(0.95))
+            .frame(width: ringW * 1.2, height: ringW * 1.2)
+            .shadow(color: cueColor, radius: 6)
+            .offset(x: radius * cos(ang), y: radius * sin(ang))
+            .animation(.easeOut(duration: 0.45), value: sweepFrac)
+    }
+
+    private func dialDeltaChip(radius: CGFloat, sweepFrac: Double, ringW: CGFloat, corr: Double) -> some View {
+        let dir: Double = opening ? 1 : -1
+        let ang = (-90.0 + dir * (sweepFrac * 360.0 + 46)) * .pi / 180
+        let chipR = radius + ringW * 2.6
+        return Text(String(format: "Δ %.2f", abs(corr)))
+            .font(Theme.mono(16, weight: .bold))
+            .foregroundStyle(cueColor)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(RoundedRectangle(cornerRadius: 7).fill(Color.black.opacity(0.72)))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(cueColor.opacity(0.85), lineWidth: 1.5))
+            .offset(x: chipR * cos(ang), y: chipR * sin(ang))
+            .animation(.easeOut(duration: 0.45), value: sweepFrac)
+    }
+
+    /// Segmented ring hugging the sphere with a slow JARVIS idle spin.
+    private func dialInnerRing(radius: CGFloat, matched: Bool) -> some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 20.0)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let spin = (t * 8).truncatingRemainder(dividingBy: 360)
+            let circumference = 2 * .pi * radius
+            let seg = circumference / 14
+            Circle()
+                .stroke((matched ? Theme.good : cueColor).opacity(0.35),
+                        style: StrokeStyle(lineWidth: 3, dash: [seg * 0.55, seg * 0.45]))
+                .frame(width: radius * 2, height: radius * 2)
+                .rotationEffect(.degrees(spin))
         }
     }
 
-    var cueColor: Color {
-        switch info.phase {
-        case .matched: return Theme.good
-        case .hold: return Theme.accent
-        case .open, .close: return Theme.warn
-        case .unavailable: return Theme.danger
-        case .acquiring, .idle: return Theme.idle
+    /// Chevrons marching just ahead of the arc tip, tangent to the ring,
+    /// pointing the direction to turn the iris ring.
+    private func dialChevrons(radius: CGFloat, sweepFrac: Double, ringW: CGFloat) -> some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let phase = (t * 2.2).truncatingRemainder(dividingBy: 1.0)
+            let dir: Double = opening ? 1 : -1
+            let tipDeg = -90.0 + dir * sweepFrac * 360.0
+            ZStack {
+                ForEach(0..<3, id: \.self) { i in
+                    let angDeg = tipDeg + dir * (14.0 + Double(i) * 13.0)
+                    let ang = angDeg * .pi / 180
+                    let local = (phase - Double(i) * 0.22).truncatingRemainder(dividingBy: 1.0)
+                    let pulse = local >= 0 && local < 0.45 ? 1.0 : 0.3
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: max(13, ringW * 1.6), weight: .heavy))
+                        .foregroundStyle(cueColor.opacity(pulse))
+                        .rotationEffect(.degrees(angDeg + (opening ? 90 : -90)))
+                        .offset(x: radius * cos(ang), y: radius * sin(ang))
+                }
+            }
         }
     }
 }
 
-struct ManualTrimGauge: View {
-    let correctionStops: Double?
-    let stability: Double
-    let color: Color
+/// Edge-anchored numerals for across-the-room reading: CURRENT on the left,
+/// TARGET on the right — large, clear of the sphere and the dial.
+struct BigIREReadouts: View {
+    let info: ManualMatchInfo
+
+    private var cueColor: Color { ManualCueStyle.color(info.phase) }
+    private var trimming: Bool { info.phase == .open || info.phase == .close }
 
     var body: some View {
-        GeometryReader { geo in
-            let width = geo.size.width
-            let center = width / 2
-            let normalized = min(1, max(-1, correctionStops ?? 0))
-            let markerX = center + CGFloat(normalized) * max(0, center - 8)
-
-            ZStack(alignment: .leading) {
-                Capsule().fill(Color.black.opacity(0.55)).frame(height: 8)
-                Capsule().stroke(Theme.line2, lineWidth: 1).frame(height: 8)
-                Rectangle()
-                    .fill(Theme.good.opacity(0.28))
-                    .frame(width: max(8, width * 0.08), height: 12)
-                    .position(x: center, y: geo.size.height / 2)
-                Rectangle()
-                    .fill(Theme.good)
-                    .frame(width: 1.5, height: 18)
-                    .position(x: center, y: geo.size.height / 2)
-                Circle()
-                    .fill(color)
-                    .frame(width: 12, height: 12)
-                    .overlay(Circle().stroke(Color.white.opacity(0.7), lineWidth: 1))
-                    .shadow(color: color.opacity(0.7), radius: 4)
-                    .position(x: markerX, y: geo.size.height / 2)
-                if stability > 0 {
-                    Capsule()
-                        .trim(from: 0, to: min(1, stability))
-                        .stroke(Theme.accent, lineWidth: 2)
-                        .frame(height: 16)
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("CURRENT")
+                    .font(.system(size: 13, weight: .bold))
+                    .tracking(2.5)
+                    .foregroundStyle(Theme.ink3)
+                Text(info.currentIRE.map { String(format: "%.1f", $0) } ?? "——")
+                    .font(Theme.mono(76, weight: .bold))
+                    .foregroundStyle(cueColor)
+                    .contentTransition(.numericText())
+                if let correction = info.correctionStops, trimming {
+                    Text(String(format: "%@ %.2f st to go",
+                                correction > 0 ? "open" : "close", abs(correction)))
+                        .font(Theme.mono(15, weight: .semibold))
+                        .foregroundStyle(Theme.ink2)
+                } else if info.phase == .hold {
+                    Text("hold steady…")
+                        .font(.system(size: 14))
+                        .foregroundStyle(Theme.ink2)
                 }
-                HStack {
-                    Text("CLOSE")
-                    Spacer()
-                    Text("OPEN")
-                }
-                .font(.system(size: 7.5, weight: .bold))
-                .tracking(0.8)
-                .foregroundStyle(Theme.ink3)
-                .offset(y: 13)
             }
-            .frame(height: 8)
-            .position(x: center, y: 7)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("TARGET")
+                    .font(.system(size: 13, weight: .bold))
+                    .tracking(2.5)
+                    .foregroundStyle(Theme.ink3)
+                Text(info.targetIRE.map { String(format: "%.1f", $0) } ?? "——")
+                    .font(Theme.mono(76, weight: .bold))
+                    .foregroundStyle(Theme.ink2)
+            }
         }
+        .padding(.horizontal, 44)
+        .shadow(color: .black.opacity(0.85), radius: 6)
+        .allowsHitTesting(false)
     }
 }
 
@@ -873,9 +1332,11 @@ struct ManualTrimFocus: View {
     @ObservedObject var node: CameraNode
 
     var info: ManualMatchInfo { node.manualMatch }
+    private var cueColor: Color { ManualCueStyle.color(info.phase) }
+    private var trimming: Bool { info.phase == .open || info.phase == .close }
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 9) {
             HStack {
                 Text(node.status.name.isEmpty ? node.ip : node.status.name)
                     .font(.system(size: 12, weight: .bold))
@@ -883,28 +1344,44 @@ struct ManualTrimFocus: View {
                 Spacer()
                 Text("ACTIVE CAMERA")
                     .font(.system(size: 8, weight: .bold))
-                    .tracking(1)
+                    .tracking(1.4)
                     .foregroundStyle(Theme.accent)
             }
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Image(systemName: cueIcon)
-                    .font(.system(size: 17, weight: .bold))
-                Text(info.phase.rawValue)
-                    .font(.system(size: 20, weight: .heavy, design: .rounded))
-                    .tracking(1.2)
+            HStack(spacing: 10) {
+                HoldRing(phase: info.phase, stability: info.stability, size: 34)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(info.phase.rawValue)
+                        .font(.system(size: 19, weight: .heavy, design: .rounded))
+                        .tracking(1.4)
+                        .foregroundStyle(cueColor)
+                    if info.phase == .hold {
+                        Text("hold steady…")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Theme.ink3)
+                    }
+                }
+                if trimming {
+                    TrimChevrons(direction: info.phase == .open ? 1 : -1,
+                                 magnitudeStops: info.correctionStops ?? 0,
+                                 color: cueColor)
+                }
                 Spacer()
-                if let correction = info.correctionStops {
-                    Text(String(format: "%.2f ST", abs(correction)))
+                if let correction = info.correctionStops, trimming {
+                    Text(String(format: "%+.2f ST", correction))
                         .font(Theme.mono(18, weight: .bold))
+                        .foregroundStyle(cueColor)
+                        .help("Signed iris move: + open, − close")
                 }
             }
-            .foregroundStyle(cueColor)
-            ManualTrimGauge(correctionStops: info.correctionStops,
-                            stability: info.stability,
+            ManualTrimGauge(correctionStops: info.correctionStops.map { -$0 },
+                            toleranceStops: info.toleranceStops,
                             color: cueColor)
-                .frame(height: 26)
+                .frame(height: 30)
             HStack {
                 Text(info.currentIRE.map { String(format: "%.1f IRE", $0) } ?? "—")
+                Spacer()
+                Text(String(format: "band ±%.2f ST", info.toleranceStops))
+                    .foregroundStyle(Theme.ink3)
                 Spacer()
                 Text(info.targetIRE.map { String(format: "target %.1f", $0) } ?? "target —")
             }
@@ -914,28 +1391,6 @@ struct ManualTrimFocus: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.panel3))
         .overlay(RoundedRectangle(cornerRadius: Theme.radiusSm).stroke(cueColor.opacity(0.55), lineWidth: 1))
-    }
-
-    var cueIcon: String {
-        switch info.phase {
-        case .open: return "arrow.right"
-        case .close: return "arrow.left"
-        case .hold: return "scope"
-        case .matched: return "checkmark.seal.fill"
-        case .unavailable: return "exclamationmark.triangle.fill"
-        case .acquiring: return "viewfinder"
-        case .idle: return "circle"
-        }
-    }
-
-    var cueColor: Color {
-        switch info.phase {
-        case .matched: return Theme.good
-        case .hold: return Theme.accent
-        case .open, .close: return Theme.warn
-        case .unavailable: return Theme.danger
-        case .acquiring, .idle: return Theme.idle
-        }
     }
 }
 
@@ -1009,10 +1464,18 @@ struct IrisMatchPanel: View {
                     .buttonStyle(DarkButtonStyle(prominent: true))
                     .disabled(array.linkStopX10 == nil || array.loopRunning)
             }
-            Button("Set Log3G10 on Array") { array.setLog3G10OnArray() }
+            HStack(spacing: 6) {
+                Button("Set Log3G10 on Array") { array.setLog3G10OnArray() }
+                    .buttonStyle(DarkButtonStyle())
+                    .disabled(array.loopRunning || array.nodes.allSatisfy { !$0.connected })
+                    .help("One deliberate rule-11 action per connected body: capture the current preset for restore, then set only the monitor output feeding the livestream mirror to Log3G10 and read it back. Record-side image settings are untouched. # UNVERIFIED until benched.")
+                Button("Restore Presets\(array.savedPresetCount > 0 ? " (\(array.savedPresetCount))" : "")") {
+                    array.restorePresetsOnArray()
+                }
                 .buttonStyle(DarkButtonStyle())
-                .disabled(array.loopRunning || array.nodes.allSatisfy { !$0.connected })
-                .help("One deliberate rule-11 action per connected body: set only the monitor output feeding the livestream mirror to Log3G10, then read it back. Record-side image settings are untouched. # UNVERIFIED until benched.")
+                .disabled(array.savedPresetCount == 0 || array.loopRunning)
+                .help("Array-wide undo of Set Log3G10: put every captured pre-swap preset back on its body. Run this before wrapping the session. Bodies whose mirror output changed mid-session are refused conservatively and keep their saved value.")
+            }
         }
         .panelCard()
     }
@@ -1041,6 +1504,23 @@ struct MatchLoopPanel: View {
             .font(.system(size: 11))
             .disabled(array.loopRunning)
 
+            if array.referenceMode == .gray18 {
+                Text(String(format: "target: %.1f IRE in Log3G10 · ~%.0f IRE via IPP2 (provisional)",
+                            Log3G10.grayAnchorIRE, ArrayController.ipp2GrayAnchorIRE))
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.ink3)
+            } else if array.referenceMode == .custom {
+                HStack(spacing: 6) {
+                    TextField("IRE", text: $array.loopTargetText)
+                        .darkField()
+                        .frame(width: 56)
+                        .disabled(array.loopRunning)
+                    Text("target IRE in the ACTIVE transform")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(Theme.ink3)
+                }
+            }
+
             configRow("IRE fallback", String(format: "±%.1f", array.toleranceIRE)) {
                 Slider(value: $array.toleranceIRE, in: 0.5...6.0, step: 0.5)
             }
@@ -1063,6 +1543,7 @@ struct MatchLoopPanel: View {
                         .buttonStyle(DarkButtonStyle(destructive: true))
                 } else {
                     Button("Start Match") { array.startMatch() }
+                        .disabled(array.referenceMode == .custom && array.loopCustomTargetIRE == nil)
                         .buttonStyle(DarkButtonStyle(prominent: true))
                 }
                 if let ref = array.referenceIRE {

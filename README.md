@@ -16,6 +16,7 @@ Two tabs:
 hardware-verified: every aperture, livestream, and transform parameter is
 `# UNVERIFIED` until the bench procedures pass on a body. Phase 0 gates the Array
 tab: do not point the match loop at an array before they pass.
+Bench day run-sheet (consolidated, manual-lens-aware): `BENCH_DAY_PLAN.md`.
 
 ## Build / run
 

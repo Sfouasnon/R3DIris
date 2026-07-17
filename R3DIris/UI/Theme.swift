@@ -66,55 +66,51 @@ enum Theme {
 
 // MARK: - Logo
 
-/// The R3DIris mark: six iris blades (trimmed arcs) sweeping teal → violet
-/// around a gray sphere — the tool in one glyph.
+/// The R3DIris mark (2026-07-17 redesign): a precision-instrument glyph —
+/// one thin graphite ring (the iris), one teal index arc (the measurement),
+/// one gray sphere (the target). Single accent, single weight logic, reads
+/// at 16 px. Deliberately quiet: third-party RED tooling, not a game badge.
 struct IrisMark: View {
     var size: CGFloat = 22
 
     var body: some View {
         ZStack {
-            ForEach(0..<6, id: \.self) { i in
-                Circle()
-                    .trim(from: 0.03, to: 0.135)
-                    .stroke(bladeColor(i), style: StrokeStyle(lineWidth: size * 0.12, lineCap: .round))
-                    .rotationEffect(.degrees(Double(i) * 60))
-            }
+            // Base ring — hairline graphite
+            Circle()
+                .stroke(Color(hex: 0x494f59), lineWidth: size * 0.055)
+            // Index arc — the single accent. 80° sweep, top-right.
+            Circle()
+                .trim(from: 0.795, to: 1.015)
+                .stroke(Theme.accent,
+                        style: StrokeStyle(lineWidth: size * 0.10, lineCap: .round))
+            // Target sphere — small, softly lit from upper-left
             Circle()
                 .fill(
-                    RadialGradient(colors: [Color(hex: 0xc9ccd2), Color(hex: 0x6f747d)],
+                    RadialGradient(colors: [Color(hex: 0xd4d7dc), Color(hex: 0x74797f)],
                                    center: UnitPoint(x: 0.38, y: 0.34),
-                                   startRadius: 0, endRadius: size * 0.30))
-                .frame(width: size * 0.42, height: size * 0.42)
+                                   startRadius: 0, endRadius: size * 0.24))
+                .frame(width: size * 0.34, height: size * 0.34)
         }
+        .padding(size * 0.06)
         .frame(width: size, height: size)
-    }
-
-    private func bladeColor(_ i: Int) -> Color {
-        // Interpolate teal → violet across the six blades.
-        let t = Double(i) / 5.0
-        return Color(
-            .sRGB,
-            red:   0.247 + t * (0.561 - 0.247),
-            green: 0.847 + t * (0.482 - 0.847),
-            blue:  0.780 + t * (1.000 - 0.780),
-            opacity: 1)
     }
 }
 
-/// Logo + wordmark for the top bar.
+/// Logo + wordmark for the top bar: mark, then quiet two-weight lettering.
+/// The mark carries the accent; the type stays monochrome.
 struct IrisWordmark: View {
     var body: some View {
-        HStack(spacing: 8) {
-            IrisMark(size: 22)
+        HStack(spacing: 9) {
+            IrisMark(size: 21)
             HStack(spacing: 0) {
                 Text("R3D")
-                    .font(.system(size: 14.5, weight: .heavy, design: .rounded))
-                    .foregroundStyle(Theme.irisGradient)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.ink2)
                 Text("IRIS")
-                    .font(.system(size: 14.5, weight: .heavy, design: .rounded))
+                    .font(.system(size: 13, weight: .bold))
                     .foregroundStyle(Theme.ink)
             }
-            .tracking(1.4)
+            .tracking(3.0)
         }
     }
 }

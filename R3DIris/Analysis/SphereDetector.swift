@@ -82,13 +82,31 @@ enum SphereDetector {
     static let gateShadowRatioMaxPass2 = 0.985 // _GATE_SHADOW_RATIO_MAX_PASS2
     static let maxCandidates = 8
 
+    /// Aspect-aware normalization width for sphere-size gates.
+    ///
+    /// The R3DMatch radius bands were calibrated on ~16:9 frames as r/WIDTH.
+    /// The livestream mirrors whatever the monitor path carries — a 2.4:1 or
+    /// letterboxed feed makes the same physical sphere a smaller fraction of
+    /// WIDTH, silently shifting the calibrated band. Normalizing by the
+    /// 16:9-equivalent width (min(w, h·16/9)) is identity on 16:9 — the
+    /// calibration is untouched — and pins the band to frame HEIGHT on wider
+    /// aspects, which is what actually bounds the sphere on set.
+    ///
+    /// NOT covered: anamorphic-squeezed streams render the sphere as an
+    /// ellipse; circle detection is expected to fail there. Bench item —
+    /// confirm the mirror output is desqueezed before relying on detection.
+    static func normalizationWidth(width: Int, height: Int) -> Double {
+        min(Double(width), Double(height) * 16.0 / 9.0)
+    }
+
     /// Detect the gray sphere in one live frame.
     /// `prior` (from the tracker) narrows the radius search ±30% and prefers
     /// nearby candidates, mirroring sphere.py's profile-prior behavior.
     static func detect(in buf: PixelBuffer, prior: SphereROI?) -> SphereDetection {
         let w = buf.width, h = buf.height
-        var rMin = max(6, Int(Double(w) * radiusMinRatio))
-        var rMax = min(h / 2, Int(Double(w) * radiusMaxRatio))
+        let normW = normalizationWidth(width: w, height: h)
+        var rMin = max(6, Int(normW * radiusMinRatio))
+        var rMax = min(h / 2, Int(normW * radiusMaxRatio))
 
         if let prior {
             let lo = max(rMin, Int(prior.r * 0.70))
@@ -118,8 +136,9 @@ enum SphereDetector {
         var lastFailedGates: [SphereGateResult] = []
 
         for cand in candidates.prefix(maxCandidates) {
-            // Pre-filter G1 — radius floor (sphere.py _PF_RADIUS_MIN)
-            if cand.r / Double(w) < pfRadiusMin { continue }
+            // Pre-filter G1 — radius floor (sphere.py _PF_RADIUS_MIN),
+            // against the aspect-normalized width (see normalizationWidth).
+            if cand.r / normW < pfRadiusMin { continue }
 
             // Pre-filter G2/G3 — interior std band.
             // Clean pass ≤ 0.020; mid band ≤ 0.130 admitted WITHOUT the BRDF
@@ -134,8 +153,8 @@ enum SphereDetector {
 
             var gates: [SphereGateResult] = []
 
-            // Gate 1: Geometry
-            let ratio = cand.r / Double(w)
+            // Gate 1: Geometry — ratio vs 16:9-equivalent width (aspect-aware)
+            let ratio = cand.r / normW
             let gGeom = SphereGateResult(
                 gate: "geometry",
                 passed: radiusMinRatio...radiusMaxRatio ~= ratio,
@@ -530,12 +549,134 @@ enum SphereDetector {
 
     private static func finalize(_ cand: Candidate, gates: [SphereGateResult],
                                  status: SphereDetection.Status, _ buf: PixelBuffer) -> SphereDetection {
-        let roi = SphereROI(cx: cand.cx, cy: cand.cy, r: cand.r)
+        // Limb-snap: the Hough center drifts toward the LIT side whenever the
+        // shadow-side limb fades into a dark backdrop (half the boundary casts
+        // no votes) — the classic symptom is a small circle hugging the
+        // specular lobe and a hero IRE read off the highlight. Refining
+        // against the actual luma limb fixes both position and measurement.
+        let roi = refineToLimb(SphereROI(cx: cand.cx, cy: cand.cy, r: cand.r), in: buf)
         return SphereDetection(
             status: status, roi: roi,
-            heroIRE: heroIRE(buf, cand.cx, cand.cy, cand.r),
+            heroIRE: heroIRE(buf, roi.cx, roi.cy, roi.r),
             gates: gates, failureReason: "",
             bufferWidth: buf.width, bufferHeight: buf.height)
+    }
+
+    // MARK: - Limb-snap refinement
+    //
+    // Cast rays from the candidate center; on each ray find the strongest
+    // luma-gradient crossing inside an annulus around the candidate radius
+    // (that's the limb, wherever it has ANY contrast), then least-squares fit
+    // a circle (Kåsa) to the hit points with one 25%-trim pass. Rays that
+    // cross no meaningful gradient (shadow limb into black) simply don't
+    // vote — the fit uses whatever arc is real instead of hallucinating.
+
+    static let refineRayCount = 48
+    static let refineMinHits = 10
+    static let refineGradFloor: Float = 0.015   // per-px luma step at the limb
+    /// Per-iteration movement cap as a fraction of r — anti-teleport. A fit
+    /// farther away than this is APPROACHED in bounded steps across the
+    /// iterations, not rejected (validated 2026-07-17: converges from a
+    /// 0.4r-off, 30%-undersized init to 0.5 px of ground truth in 4 steps).
+    static let refineMaxShift = 0.35
+
+    static func refineToLimb(_ initial: SphereROI, in buf: PixelBuffer, iterations: Int = 4) -> SphereROI {
+        var roi = initial
+        for _ in 0..<iterations {
+            var pts: [(Double, Double, Double)] = []   // x, y, |grad| weight
+            let r0 = roi.r * 0.55, r1 = roi.r * 1.45
+            for k in 0..<refineRayCount {
+                let ang = Double(k) * 2.0 * .pi / Double(refineRayCount)
+                let ux = cos(ang), uy = sin(ang)
+                var bestMag: Float = 0
+                var bestT = -1.0
+                var prev: Float? = nil
+                var t = r0
+                while t <= r1 {
+                    let x = Int((roi.cx + ux * t).rounded())
+                    let y = Int((roi.cy + uy * t).rounded())
+                    guard x >= 0, x < buf.width, y >= 0, y < buf.height else { break }
+                    let v = buf.luma[y * buf.width + x]
+                    if let p = prev {
+                        let mag = abs(v - p)
+                        if mag > bestMag { bestMag = mag; bestT = t - 0.5 }
+                    }
+                    prev = v
+                    t += 1.0
+                }
+                if bestMag >= refineGradFloor, bestT > 0 {
+                    pts.append((roi.cx + ux * bestT, roi.cy + uy * bestT, Double(bestMag)))
+                }
+            }
+            guard pts.count >= refineMinHits,
+                  var fit = kasaFit(pts) else { return roi }
+            // One robust trim: drop the worst quarter by radial residual, refit.
+            let residuals = pts.map { p in
+                abs(hypot(p.0 - fit.cx, p.1 - fit.cy) - fit.r)
+            }
+            let cutoff = residuals.sorted()[residuals.count * 3 / 4]
+            let kept = zip(pts, residuals).filter { $0.1 <= cutoff }.map(\.0)
+            if kept.count >= refineMinHits, let refit = kasaFit(kept) {
+                fit = refit
+            }
+            // Sanity: a radius that balloons or collapses is a bad fit.
+            guard fit.r >= roi.r * 0.6, fit.r <= roi.r * 1.6, fit.r >= 4 else { return roi }
+            // Anti-teleport: move TOWARD a distant fit in bounded steps
+            // rather than rejecting it — converges from poor initializations
+            // while a single frame still can't yank the lock across the frame.
+            let shift = hypot(fit.cx - roi.cx, fit.cy - roi.cy)
+            let maxStep = roi.r * refineMaxShift
+            if shift > maxStep {
+                let s = maxStep / shift
+                roi = SphereROI(cx: roi.cx + (fit.cx - roi.cx) * s,
+                                cy: roi.cy + (fit.cy - roi.cy) * s,
+                                r: roi.r + (fit.r - roi.r) * s)
+            } else {
+                roi = SphereROI(cx: fit.cx, cy: fit.cy, r: fit.r)
+            }
+        }
+        return roi
+    }
+
+    /// Kåsa algebraic circle fit: minimize Σ(x²+y²+Dx+Ey+F)². Weighted by
+    /// gradient magnitude so strong limb points dominate faint ones.
+    private static func kasaFit(_ pts: [(Double, Double, Double)]) -> (cx: Double, cy: Double, r: Double)? {
+        var sxx = 0.0, sxy = 0.0, syy = 0.0, sx = 0.0, sy = 0.0, sw = 0.0
+        var sxz = 0.0, syz = 0.0, sz = 0.0
+        for (x, y, w) in pts {
+            let z = x * x + y * y
+            sxx += w * x * x; sxy += w * x * y; syy += w * y * y
+            sx += w * x; sy += w * y; sw += w
+            sxz += w * x * z; syz += w * y * z; sz += w * z
+        }
+        guard sw > 0 else { return nil }
+        // Normal equations for [D, E, F]:
+        //   [sxx sxy sx][D]   [-sxz]
+        //   [sxy syy sy][E] = [-syz]
+        //   [sx  sy  sw][F]   [-sz ]
+        var m = [[sxx, sxy, sx, -sxz],
+                 [sxy, syy, sy, -syz],
+                 [sx, sy, sw, -sz]]
+        // Gaussian elimination with partial pivoting.
+        for col in 0..<3 {
+            var pivot = col
+            for row in (col + 1)..<3 where abs(m[row][col]) > abs(m[pivot][col]) { pivot = row }
+            if abs(m[pivot][col]) < 1e-12 { return nil }
+            m.swapAt(col, pivot)
+            let div = m[col][col]
+            for j in col..<4 { m[col][j] /= div }
+            for row in 0..<3 where row != col {
+                let factor = m[row][col]
+                if factor != 0 {
+                    for j in col..<4 { m[row][j] -= factor * m[col][j] }
+                }
+            }
+        }
+        let d = m[0][3], e = m[1][3], f = m[2][3]
+        let cx = -d / 2, cy = -e / 2
+        let r2 = cx * cx + cy * cy - f
+        guard r2 > 0 else { return nil }
+        return (cx, cy, r2.squareRoot())
     }
 
     private static func failed(_ reason: String, _ buf: PixelBuffer,

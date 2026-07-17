@@ -34,6 +34,10 @@ final class ArrayController: ObservableObject {
     @Published var sourceIP: String = ""       // field notes rule 16 (link-local NICs)
     @Published private(set) var nodes: [CameraNode] = []
     @Published var selectedNodeID: UUID? = nil
+    /// Double-clicked tile shown full-screen with the large trim overlay.
+    @Published var fullScreenNodeID: UUID? = nil
+
+    var fullScreenNode: CameraNode? { nodes.first { $0.id == fullScreenNodeID } }
 
     // MARK: Discovery (V3's method, ported: TCP subnet sweep on :9998 primary,
     // UDP CAMINFO broadcast fallback — both spend ZERO camera session slots.
@@ -61,9 +65,24 @@ final class ArrayController: ObservableObject {
     enum ReferenceMode: String, CaseIterable, Identifiable {
         case median = "Median camera"
         case hero = "Selected camera"
+        case gray18 = "18% gray anchor"
+        case custom = "Custom IRE"
         var id: String { rawValue }
     }
     @Published var referenceMode: ReferenceMode = .median
+    @Published var loopTargetText: String = String(format: "%.1f", Log3G10.grayAnchorIRE)
+
+    /// 18% gray's approximate IRE through the IPP2/SDR display path —
+    /// operator-supplied working value ("41–43 in IPP2"; Stephen 2026-07-17).
+    /// # PROVISIONAL: refine on the bench against a metered gray sphere.
+    /// The Log3G10 anchor (33.3) is exact; this one is display-path-dependent.
+    static let ipp2GrayAnchorIRE = 42.0
+
+    var loopCustomTargetIRE: Double? {
+        guard let value = Double(loopTargetText.trimmingCharacters(in: .whitespaces)),
+              value > 0, value < 100 else { return nil }
+        return value
+    }
     @Published var toleranceIRE: Double = 2.0      // convergence tolerance (±IRE)
     @Published var toleranceStops: Double = 0.05   // Log3G10 scene-linear convergence tolerance
     @Published var nudgeBudget: Int = 8            // DoF cap in list steps (8 × ¼-stop = 2 stops)
@@ -142,25 +161,63 @@ final class ArrayController: ObservableObject {
 
     // MARK: - Discovery
 
-    /// PRIMARY: TCP-sweep the subnet on :9998 (V1/V2.1's proven method).
-    /// FALLBACK: UDP CAMINFO broadcast when the sweep is empty or no subnet
-    /// is set. Already-added bodies are skipped (rule 2 — never touch a live
-    /// session).
+    /// PRIMARY: TCP-sweep on :9998 (V1/V2.1's proven method). With an EMPTY
+    /// subnet field the sweep targets are AUTO-DETECTED from this Mac's own
+    /// interfaces (RED Control Pro-style zero-config — the operator never
+    /// types network numbers unless the auto sweep comes up dry; the field
+    /// remains the manual override for routed/odd topologies).
+    /// FALLBACK: UDP CAMINFO broadcast when every sweep is empty.
+    /// Already-added bodies are skipped (rule 2 — never touch a live session).
     func discover() {
         guard !discovering else { return }
         discovering = true
-        let cidr = subnet.trimmingCharacters(in: .whitespaces)
+        let manualCIDR = subnet.trimmingCharacters(in: .whitespaces)
         let source = sourceIP.trimmingCharacters(in: .whitespaces)
-        let src = source.isEmpty ? nil : source
+        var src = source.isEmpty ? nil : source
+        // Guard: a source IP this Mac doesn't own binds every probe to a
+        // dead local endpoint and the whole sweep fails SILENTLY (bench
+        // finding 2026-07-17). Ignore it loudly instead.
+        if let candidate = src, !LocalSubnets.ownIPv4Addresses().contains(candidate) {
+            log("discovery: source IP \(candidate) is not an address on this Mac — IGNORING it for this sweep (rule 16 wants one of YOUR interface addresses, not the camera subnet)")
+            src = nil
+        }
         let known = Set(nodes.map(\.ip))
         Task {
+            var targets: [String] = []
+            if manualCIDR.isEmpty {
+                let detected = LocalSubnets.detect()
+                targets = detected.map(\.cidr)
+                if detected.isEmpty {
+                    log("discovery: no local IPv4 subnets detected — CAMINFO broadcast only")
+                } else {
+                    log("discovery: auto-detected " + detected.map {
+                        "\($0.cidr) (\($0.interface), \($0.hostCount) hosts)"
+                    }.joined(separator: ", ") + " — wide masks clamped to /24 around this host")
+                }
+            } else {
+                targets = [manualCIDR]
+            }
+
             var found: [DiscoveredCamera] = []
-            if !cidr.isEmpty {
+            for cidr in targets {
                 log("discovery: TCP sweep \(cidr) :9998 (\(Subnet.hosts(from: cidr).count) hosts)")
-                found = await TCPScan.discover(cidr: cidr, sourceIP: src, skip: known)
+                let hits = await TCPScan.discover(cidr: cidr, sourceIP: src,
+                                                  skip: known.union(found.map(\.ip)))
+                found.append(contentsOf: hits)
+            }
+            // Sim convenience: a :9998 listener on plain 127.0.0.1 is always
+            // the simulator (real bodies never live there) — one free probe
+            // makes the no-sudo single-sim case zero-config too.
+            if !known.contains("127.0.0.1"), !found.contains(where: { $0.ip == "127.0.0.1" }) {
+                let simHits = await TCPScan.discover(cidr: "127.0.0.1/32", sourceIP: nil,
+                                                     skip: known.union(found.map(\.ip)))
+                if !simHits.isEmpty {
+                    log("discovery: simulator detected on 127.0.0.1")
+                    found.append(contentsOf: simHits)
+                }
             }
             if found.isEmpty {
-                log("discovery: CAMINFO broadcast\(cidr.isEmpty ? " (no subnet set)" : " fallback")")
+                log("discovery: CAMINFO broadcast\(targets.isEmpty ? "" : " fallback")")
                 let udp = await UDPDiscovery.discover(sourceIP: src)
                 found = udp.filter { !known.contains($0.ip) }
             }
@@ -190,6 +247,10 @@ final class ArrayController: ObservableObject {
         let ip = newIP.trimmingCharacters(in: .whitespaces)
         guard !ip.isEmpty else { return }
         newIP = ""
+        if ip.hasSuffix(".0") {
+            // Bench finding 2026-07-17: "127.0.0.0" got added as a camera.
+            log("warning: \(ip) looks like a NETWORK address, not a camera (did you mean the camera's own IP, e.g. \(ip.dropLast())1?) — adding anyway")
+        }
         addNode(ip: ip, label: "")
     }
 
@@ -204,6 +265,7 @@ final class ArrayController: ObservableObject {
     }
 
     func removeCamera(_ node: CameraNode) {
+        if fullScreenNodeID == node.id { fullScreenNodeID = nil }
         guard !manualSessionActive else {
             log("remove camera: blocked while Manual Assist owns reversible output state — Finish or Abort first")
             return
@@ -254,6 +316,12 @@ final class ArrayController: ObservableObject {
 
     /// One deliberate rule-11 array action. Each body is processed serially so
     /// a bad/unverified parameter remains attributable to one camera session.
+    /// Prior display presets captured by Set Log3G10, keyed by node —
+    /// what Restore Presets puts back. In-memory only; every captured value
+    /// is also logged, so a crashed session can be recovered from the log.
+    private var savedLoopTransforms: [UUID: MonitorTransformReading] = [:]
+    @Published private(set) var savedPresetCount = 0
+
     func setLog3G10OnArray() {
         guard !loopRunning, !manualSessionActive else { return }
         Task {
@@ -266,11 +334,48 @@ final class ArrayController: ObservableObject {
             var confirmed = 0
             for node in targets {
                 guard let camera = node.camera else { continue }
+                // Capture the pre-swap preset FIRST so Restore Presets can
+                // put the operator's monitor path back after matching.
+                let before = await camera.readActiveMonitorTransform()
+                if let value = before.presetValue, !before.parameterID.isEmpty,
+                   value != RCP2.log3G10DisplayPresetValue,
+                   savedLoopTransforms[node.id] == nil {
+                    savedLoopTransforms[node.id] = before
+                    log("set Log3G10: [\(node.ip)] saved prior preset \(before.parameterID) = \(value) (\(RCP2.displayPresetLabels[value] ?? "?")) for restore")
+                }
                 let ok = await camera.setActiveMonitorLog3G10()
                 if ok { confirmed += 1 }
                 log("set Log3G10: [\(node.ip)] \(ok ? "confirmed" : "FAILED / unconfirmed")")
             }
+            savedPresetCount = savedLoopTransforms.count
             log("set Log3G10: complete — \(confirmed)/\(targets.count) confirmed")
+        }
+    }
+
+    /// Array-wide undo of Set Log3G10: put every captured pre-swap preset
+    /// back. Per-camera restore is conservative (CameraActor refuses when
+    /// the mirrored output changed or a third preset appeared mid-session) —
+    /// refused bodies KEEP their saved value so the operator can retry.
+    func restorePresetsOnArray() {
+        guard !loopRunning, !manualSessionActive, !savedLoopTransforms.isEmpty else { return }
+        Task {
+            log("restore presets: starting on \(savedLoopTransforms.count) camera(s)")
+            var restored = 0
+            for node in nodes {
+                guard let saved = savedLoopTransforms[node.id] else { continue }
+                guard node.connected, let camera = node.camera else {
+                    log("restore presets: [\(node.ip)] SKIPPED — not connected (saved value retained)")
+                    continue
+                }
+                let ok = await camera.restoreMonitorTransform(saved)
+                if ok {
+                    savedLoopTransforms.removeValue(forKey: node.id)
+                    restored += 1
+                }
+                log("restore presets: [\(node.ip)] \(ok ? "restored" : "REFUSED / failed — saved value retained")")
+            }
+            savedPresetCount = savedLoopTransforms.count
+            log("restore presets: complete — \(restored) restored, \(savedLoopTransforms.count) outstanding")
         }
     }
 
@@ -320,6 +425,7 @@ final class ArrayController: ObservableObject {
         manualMatchedCount = 0
         manualArraySpreadStops = nil
         manualCommonDriftStops = nil
+        for node in nodes { node.fastAnalysis = false }   // back to the 3 Hz cadence
         manualParticipantIDs.removeAll()
         manualStableSince.removeAll()
         manualArrayStableSince = nil
@@ -375,6 +481,7 @@ final class ArrayController: ObservableObject {
         }
 
         manualParticipantIDs = Set(parts.map(\.id))
+        for node in parts { node.fastAnalysis = true }   // human-in-the-loop fast path
         manualParticipantCount = parts.count
         if !manualParticipantIDs.contains(selectedNodeID ?? UUID()) {
             selectedNodeID = parts.first?.id
@@ -525,7 +632,11 @@ final class ArrayController: ObservableObject {
                    let ire = node.sphere.heroIRE {
                     var values = manualRecentIRE[node.id, default: []]
                     values.append(ire)
-                    if values.count > 5 { values.removeFirst(values.count - 5) }
+                    // Median-of-3 (was 5): with the fast analysis path this
+                    // halves the human feedback delay while still rejecting
+                    // single-frame outliers. Latency is the enemy of a hand
+                    // on an iris ring.
+                    if values.count > 3 { values.removeFirst(values.count - 3) }
                     manualRecentIRE[node.id] = values
                     manualLastMeasurementAt[node.id] = measuredAt
                 }
@@ -558,6 +669,7 @@ final class ArrayController: ObservableObject {
             node.manualMatch.correctionStops = correction
             node.manualMatch.deltaIRE = current - target
             node.manualMatch.baselineIRE = baseline
+            node.manualMatch.toleranceStops = manualToleranceStops
 
             if abs(correction) <= manualToleranceStops {
                 let since = manualStableSince[node.id] ?? now
@@ -831,6 +943,12 @@ final class ArrayController: ObservableObject {
             let ires = parts.compactMap { $0.sphere.heroIRE }.sorted()
             guard !ires.isEmpty else { return nil }
             return ires[ires.count / 2]
+        case .gray18:
+            // Absolute target: 18% gray's expected level for the ACTIVE
+            // transform — exact in Log3G10, provisional through IPP2.
+            return loopUsesLog3G10 ? Log3G10.grayAnchorIRE : Self.ipp2GrayAnchorIRE
+        case .custom:
+            return loopCustomTargetIRE
         }
     }
 

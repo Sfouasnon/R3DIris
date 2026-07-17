@@ -27,9 +27,21 @@ final class CameraNode: ObservableObject, Identifiable {
     private var tracker = SphereTracker()
     private weak var soakRecorder: SoakRecorder?
 
-    /// Analysis cadence — ~3 Hz keeps 12 nodes cheap; the loop's debounce
-    /// dominates responsiveness anyway (handoff §8: don't chase noise).
+    /// Analysis cadence — ~3 Hz keeps 12–40 nodes cheap; the auto loop's
+    /// debounce dominates its responsiveness anyway (handoff §8).
+    /// Manual trimming is different: a human is inside the feedback loop, so
+    /// participants get a fast path (~6.7 Hz) to cut measurement latency —
+    /// that delay is what forces slow iris movements.
     static let analysisInterval: TimeInterval = 0.33
+    static let fastAnalysisInterval: TimeInterval = 0.15
+
+    /// Set by ArrayController for Manual Assist participants / the
+    /// full-screen camera; reverts when the session or fullscreen ends.
+    var fastAnalysis = false
+
+    private var currentAnalysisInterval: TimeInterval {
+        fastAnalysis ? Self.fastAnalysisInterval : Self.analysisInterval
+    }
 
     private var analyzing = false
     private var lastAnalysis = Date.distantPast
@@ -143,7 +155,7 @@ final class CameraNode: ObservableObject, Identifiable {
     // MARK: - Analysis
 
     private func analyzeThrottled(_ img: CGImage) {
-        guard !analyzing, Date().timeIntervalSince(lastAnalysis) >= Self.analysisInterval else { return }
+        guard !analyzing, Date().timeIntervalSince(lastAnalysis) >= currentAnalysisInterval else { return }
         analyzing = true
         lastAnalysis = Date()
         let handle = FrameHandle(image: img)
@@ -172,8 +184,13 @@ final class CameraNode: ObservableObject, Identifiable {
             let det = detection
             let g = grid
             let elapsedMS = Double(DispatchTime.now().uptimeNanoseconds - analysisStarted) / 1_000_000
+            // `self` here is the weak-captured VAR from the detached closure;
+            // rebinding to an immutable local before the @Sendable MainActor
+            // closure captures it silences the Swift-6 "captured var" warning
+            // without changing semantics.
+            let node = self
             await MainActor.run {
-                self?.applyAnalysis(detection: det, grid: g, analysisMS: elapsedMS)
+                node?.applyAnalysis(detection: det, grid: g, analysisMS: elapsedMS)
             }
         }
     }
@@ -248,5 +265,8 @@ struct ManualMatchInfo: Sendable, Equatable {
     var deltaIRE: Double? = nil
     /// 0...1 progress through the stability hold once inside tolerance.
     var stability: Double = 0
+    /// The session's match tolerance in stops — sizes the HUD's target band
+    /// so the gauge shows the REAL capture zone, not a cosmetic one.
+    var toleranceStops: Double = 0.10
     var detail: String = ""
 }

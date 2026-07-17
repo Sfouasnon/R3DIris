@@ -93,13 +93,16 @@ enum TCPScan {
         }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
         // Per-connection serial queue: stateUpdateHandler and the timeout closure
-        // never race, so a plain Bool guards the single continuation resume.
+        // never race, so a single resume flag suffices. DIVERGENCE from the V3
+        // original (deliberate, compiler-driven): the flag lives in an
+        // @unchecked Sendable box and `finish` is @Sendable so Swift 6 accepts
+        // the capture — the serial queue is still what makes it safe.
         let q = DispatchQueue(label: "rcp2.tcpscan.\(host)")
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            var done = false
-            func finish(_ ok: Bool) {
-                if done { return }
-                done = true
+            let state = ResumeState()
+            @Sendable func finish(_ ok: Bool) {
+                if state.done { return }
+                state.done = true
                 conn.cancel()
                 cont.resume(returning: ok)
             }
@@ -115,6 +118,11 @@ enum TCPScan {
             q.asyncAfter(deadline: .now() + timeout) { finish(false) }
         }
     }
+
+    /// Single-resume flag for `probe` — mutation is confined to the probe's
+    /// per-connection serial queue; @unchecked Sendable documents that the
+    /// queue, not the type, provides the safety.
+    private final class ResumeState: @unchecked Sendable { var done = false }
 
     private static func ipKey(_ ip: String) -> UInt32 {
         let p = ip.split(separator: ".").compactMap { UInt8($0) }

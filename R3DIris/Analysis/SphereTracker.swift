@@ -40,6 +40,13 @@ struct SphereTracker {
     static let hitsToLock = 3
     static let missesToUnlock = 10       // ≈3 s of continuous failure drops the lock
     static let matchDistanceRatio = 0.5  // new det within 0.5·r of lock = same sphere
+    /// EMA weight for in-place re-detections. The sphere is static on a
+    /// volumetric stage — per-frame detection scatter (JPEG noise, integer
+    /// Hough cells) is measurement noise, not motion, so the displayed/
+    /// measured ROI converges instead of wandering. Real drift still tracks
+    /// (~1 s to close 70% of a move at 3 Hz); a JUMP past the match distance
+    /// resets hard and re-confirms, so reframes aren't smoothed away.
+    static let smoothing = 0.30
 
     private(set) var state = SphereState()
     private var hits = 0
@@ -64,7 +71,15 @@ struct SphereTracker {
                 hits = 1    // sphere (or detection) jumped — restart persistence
             }
             misses = 0
-            state.cx = nx; state.cy = ny; state.r = nr
+            if near {
+                // In-place re-detection: blend, don't replace (see `smoothing`).
+                let a = Self.smoothing
+                state.cx += (nx - state.cx) * a
+                state.cy += (ny - state.cy) * a
+                state.r += (nr - state.r) * a
+            } else {
+                state.cx = nx; state.cy = ny; state.r = nr
+            }
             state.heroIRE = det.heroIRE
             state.measuredAt = Date()
             if hits >= Self.hitsToLock {
