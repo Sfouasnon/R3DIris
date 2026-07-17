@@ -1,0 +1,26 @@
+# Keep local engineering handoffs and research notes out of the repository.
+*.md
+!README.md
+!CHANGELOG.md
+
+# Vendor/reference documents
+*.pdf
+
+# macOS / Xcode user state
+.DS_Store
+**/xcuserdata/
+*.xcuserstate
+DerivedData/
+*.xcresult
+
+# Swift / Python generated state
+.build/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated and temporary artifacts
+tmp/
+tools/icon/out/
+*.log
