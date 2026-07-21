@@ -1,7 +1,7 @@
 //  ArrayView.swift — R3DIris / Array (Phase 2)
 //  The Iris Match surface, in R3DIris's own identity (UI/Theme.swift):
-//  discovery toolbar (TCP sweep primary, CAMINFO fallback, manual IP as the
-//  fallback path) · camera-tile grid (live view + sphere overlay + aperture
+//  discovery toolbar (CAMINFO broadcast primary, TCP sweep fill-in, manual IP
+//  as the fallback path) · camera-tile grid (live view + sphere overlay + aperture
 //  state) · Iris Match / Exposure Match panels · waveform · array log.
 //  Root chrome (background, logo, tab switcher) lives in ContentView.
 
@@ -16,6 +16,14 @@ struct ArrayView: View {
             if let fs = array.fullScreenNode {
                 FullscreenCameraView(node: fs)
                     .transition(.opacity)
+            }
+        }
+        // Hands-free: sweep for cameras when the Array tab first appears and
+        // nothing is set up yet. Guarded so switching back to the tab with an
+        // array already running (or discovering) doesn't re-sweep.
+        .task {
+            if array.nodes.isEmpty && array.discovered.isEmpty && !array.discovering {
+                array.discover()
             }
         }
     }
@@ -256,11 +264,11 @@ struct CameraTile: View {
             // Identity row
             HStack(spacing: 7) {
                 StatusDot(level: linkLevel)
-                Text(node.status.name.isEmpty ? node.ip : node.status.name)
+                Text(node.status.displayID.isEmpty ? node.ip : node.status.displayID)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Theme.ink)
                     .lineLimit(1)
-                if !node.status.name.isEmpty {
+                if !node.status.displayID.isEmpty {
                     Text(node.ip)
                         .font(Theme.mono(9.5))
                         .foregroundStyle(Theme.ink3)
@@ -277,6 +285,12 @@ struct CameraTile: View {
                 apertureChip
                 sphereChip
                 transformChip
+                if node.streamStale {
+                    Text("STALE")
+                        .font(Theme.mono(9, weight: .bold))
+                        .foregroundStyle(Theme.warn)
+                        .help("Livestream frozen — frames stopped changing. Check the camera feed / mirror source.")
+                }
                 Spacer()
                 matchChip
             }
@@ -298,6 +312,13 @@ struct CameraTile: View {
                         if stream.isStreaming { node.stopStream() } else { node.startStream() }
                     }
                     .buttonStyle(DarkButtonStyle())
+                    // One-click accept of a good auto-detected mask — no need to
+                    // open the camera and click the sphere.
+                    if node.sphere.hasROI, !node.sphere.seeded {
+                        Button("Lock Mask") { array.acceptAutoMask(node) }
+                            .buttonStyle(DarkButtonStyle(prominent: true))
+                            .help("Accept the current auto-detected mask as the seed.")
+                    }
                     Button("Re-detect") { node.redetect() }
                         .buttonStyle(DarkButtonStyle())
                         .disabled(!stream.isStreaming)
@@ -754,8 +775,33 @@ struct FullscreenCameraView: View {
                         // lock circle so the sphere stays fully visible.
                         if manualActive {
                             IrisDialOverlay(sphere: node.sphere, info: node.manualMatch)
+                        } else if let seed = node.pendingSeed {
+                            PendingSeedOverlay(seed: seed)
                         } else {
                             SphereOverlay(sphere: node.sphere)
+                        }
+                    }
+                    // Click-to-seed: outside a manual session, clicking places
+                    // the sphere center (a pending mask you size + Approve). If
+                    // a mask is already pending, a click re-places its center.
+                    // This overlay tracks the fitted image frame, the same space
+                    // the overlays draw in, so the click maps to normalized.
+                    .overlay {
+                        if !manualActive {
+                            GeometryReader { geo in
+                                Color.clear
+                                    .contentShape(Rectangle())
+                                    .gesture(DragGesture(minimumDistance: 0).onEnded { v in
+                                        guard geo.size.width > 0, geo.size.height > 0 else { return }
+                                        let nx = Double(v.location.x / geo.size.width)
+                                        let ny = Double(v.location.y / geo.size.height)
+                                        if node.pendingSeed != nil {
+                                            node.moveSeedCenter(normX: nx, normY: ny)
+                                        } else {
+                                            array.seedSphere(node, normX: nx, normY: ny)
+                                        }
+                                    })
+                            }
                         }
                     }
             } else {
@@ -772,7 +818,7 @@ struct FullscreenCameraView: View {
                 // Header strip
                 HStack(spacing: 10) {
                     StatusDot(level: node.connected ? .ok : .off)
-                    Text(node.status.name.isEmpty ? node.ip : node.status.name)
+                    Text(node.status.displayID.isEmpty ? node.ip : node.status.displayID)
                         .font(.system(size: 15, weight: .bold))
                         .foregroundStyle(Theme.ink)
                     Text(node.ip)
@@ -787,6 +833,19 @@ struct FullscreenCameraView: View {
                             .foregroundStyle(Theme.accent)
                     }
                     Spacer()
+                    Button { array.fullscreenStep(-1) } label: {
+                        Image(systemName: "chevron.left").font(.system(size: 12, weight: .bold))
+                    }
+                    .buttonStyle(DarkButtonStyle())
+                    .help("Previous camera")
+                    Button { array.fullscreenStep(1) } label: {
+                        HStack(spacing: 4) {
+                            Text("Next Camera").font(.system(size: 12, weight: .semibold))
+                            Image(systemName: "chevron.right").font(.system(size: 12, weight: .bold))
+                        }
+                    }
+                    .buttonStyle(DarkButtonStyle(prominent: true))
+                    .help("Jump to the next camera (ID order) without minimizing")
                     Button {
                         array.fullScreenNodeID = nil
                     } label: {
@@ -794,16 +853,26 @@ struct FullscreenCameraView: View {
                             .font(.system(size: 12, weight: .bold))
                     }
                     .buttonStyle(DarkButtonStyle())
-                    .help("Exit full screen (Esc or double-click)")
+                    .help("Exit full screen (Esc)")
                 }
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .background(LinearGradient(colors: [Color.black.opacity(0.7), .clear],
                                            startPoint: .top, endPoint: .bottom))
+                if !manualActive, node.pendingSeed == nil {
+                    Text(node.sphere.seeded ? "Sphere locked — click to re-place, or Re-detect to clear"
+                                            : "Click the sphere center to place a mask")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.ink3)
+                        .padding(.top, 2)
+                }
                 Spacer()
+                if !manualActive, let seed = node.pendingSeed {
+                    SeedControlBar(node: node, seed: seed)
+                }
             }
         }
-        .contentShape(Rectangle())
-        .gesture(TapGesture(count: 2).onEnded { array.fullScreenNodeID = nil })
+        // Exit via Esc or the collapse button — the image itself is the
+        // click-to-seed surface, so no tap-to-exit here.
         .onExitCommand { array.fullScreenNodeID = nil }
     }
 }
@@ -1081,12 +1150,19 @@ struct SphereOverlay: View {
     var body: some View {
         GeometryReader { geo in
             if sphere.hasROI {
+                let cx = sphere.cx * geo.size.width
+                let cy = sphere.cy * geo.size.height
                 let d = sphere.r * 2 * geo.size.width
+                // Center sample point — the hero-IRE probe region (0.24r disk).
+                let sd = sphere.r * 0.24 * 2 * geo.size.width
                 Circle()
                     .stroke(color, lineWidth: 2)
                     .frame(width: d, height: d)
-                    .position(x: sphere.cx * geo.size.width,
-                              y: sphere.cy * geo.size.height)
+                    .position(x: cx, y: cy)
+                Circle()
+                    .fill(color.opacity(0.35))
+                    .frame(width: max(sd, 5), height: max(sd, 5))
+                    .position(x: cx, y: cy)
             }
         }
         .allowsHitTesting(false)
@@ -1099,6 +1175,65 @@ struct SphereOverlay: View {
         case .candidate: return Theme.accent
         case .searching: return .clear
         }
+    }
+}
+
+/// Pending (un-approved) sphere mask: dashed circle, the center sample-point
+/// disk, and a center dot — drawn in the same normalized space as SphereOverlay.
+struct PendingSeedOverlay: View {
+    let seed: PendingSeed
+
+    var body: some View {
+        GeometryReader { geo in
+            let cx = seed.cx * geo.size.width
+            let cy = seed.cy * geo.size.height
+            let d = seed.r * 2 * geo.size.width
+            let sd = seed.r * 0.24 * 2 * geo.size.width
+            Circle()
+                .stroke(Theme.accent, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                .frame(width: d, height: d)
+                .position(x: cx, y: cy)
+            Circle()
+                .fill(Theme.accent.opacity(0.45))
+                .frame(width: max(sd, 6), height: max(sd, 6))
+                .position(x: cx, y: cy)
+            Circle()
+                .fill(Theme.accent)
+                .frame(width: 4, height: 4)
+                .position(x: cx, y: cy)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// Bottom bar shown while sizing a pending sphere mask in full screen.
+struct SeedControlBar: View {
+    @EnvironmentObject var array: ArrayController
+    @ObservedObject var node: CameraNode
+    let seed: PendingSeed
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Mask size")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.ink3)
+            Slider(value: Binding(get: { node.pendingSeed?.r ?? seed.r },
+                                  set: { node.setSeedRadius($0) }),
+                   in: 0.02...0.32)
+                .frame(maxWidth: 320)
+            Text(String(format: "r %.0f%%", seed.r * 100))
+                .font(Theme.mono(11))
+                .foregroundStyle(Theme.ink2)
+                .frame(width: 52, alignment: .leading)
+            Button("Approve") { array.approveSeed(node) }
+                .buttonStyle(DarkButtonStyle(prominent: true))
+            Button("Cancel") { array.cancelSeed(node) }
+                .buttonStyle(DarkButtonStyle())
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(LinearGradient(colors: [.clear, Color.black.opacity(0.8)],
+                                   startPoint: .top, endPoint: .bottom))
     }
 }
 
@@ -1119,6 +1254,31 @@ struct ArrayActionsPanel: View {
                     .buttonStyle(DarkButtonStyle(destructive: true))
             }
             .disabled(array.manualSessionActive)
+
+            // Stays enabled during a match: recovers timed-out livestreams in
+            // place without aborting or losing seeds.
+            HStack(spacing: 8) {
+                Button("Reconnect Streams") { array.reconnectStreams() }
+                    .buttonStyle(DarkButtonStyle())
+                    .help("Revive dropped sessions and restart timed-out livestreams. Safe mid-match — keeps seeds, masks, and the Log3G10 swap.")
+                Toggle(isOn: $array.autoRecoverStreams) {
+                    Text("Auto-recover")
+                        .font(Theme.mono(10.5))
+                        .foregroundStyle(Theme.ink2)
+                }
+                .toggleStyle(.switch)
+                .tint(Theme.accent)
+                .help("Automatically restart any livestream that drops or stalls (per-camera backoff). Leaves seeds and the transform untouched.")
+            }
+
+            Toggle(isOn: $array.logSphereDiagnostics) {
+                Text("Log sphere detector diagnostics (Hough + gate ladder, unseeded cameras)")
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.ink2)
+            }
+            .toggleStyle(.switch)
+            .tint(Theme.accent)
+            .help("For cameras you leave un-seeded, logs why auto-detect did or didn't latch: candidate count, support, and each gate's value. Throttled to ~1.5s per camera.")
             if array.matchWorkflow == .electronic {
                 Button("Prepare — e-iris gate + AE check + subscribe") { array.prepareAll() }
                     .buttonStyle(DarkButtonStyle())
@@ -1130,6 +1290,28 @@ struct ArrayActionsPanel: View {
                     .foregroundStyle(Theme.ink3)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            // Livestream quality — Q100 default; every push is read-back
+            // verified per body (a silent Q25 flattens sphere shading).
+            HStack(spacing: 6) {
+                Text("Livestream Q")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.ink3)
+                Picker("Quality", selection: $array.arrayQuality) {
+                    ForEach([1, 2, 3, 4], id: \.self) { q in
+                        Text(RCP2.livestreamQualityLabels[q] ?? "\(q)").tag(q)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 120)
+                Button("Apply") { array.setQualityAll() }
+                    .buttonStyle(DarkButtonStyle())
+                    .disabled(array.manualSessionActive || array.nodes.isEmpty)
+            }
+            Text("Q100 default, verified per body. Streams come up at this quality; drop it only if viewing many feeds strains the network.")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .panelCard()
     }
@@ -1180,6 +1362,21 @@ struct ManualAssistPanel: View {
                 .foregroundStyle(Theme.ink3)
                 .fixedSize(horizontal: false, vertical: true)
 
+            Picker("Monitoring", selection: $array.manualTransform) {
+                ForEach(ArrayController.ManualTransform.allCases) { t in
+                    Text(t.rawValue).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(array.manualSessionActive)
+            Text(array.manualTransform.isLog3G10
+                 ? "Swaps the chosen output's Look (LCD or SDI) to Log3G10 for the match (18% gray = 33.3 IRE); restores it on Finish/Abort. Pick the output your livestream mirrors."
+                 : "Matches in the current display transform, outputs untouched (18% gray ≈ 42.3 IRE in IPP2).")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+
             Picker("Target", selection: $array.manualTargetMode) {
                 ForEach(ArrayController.ManualTargetMode.allCases) { mode in
                     Text(mode.rawValue).tag(mode)
@@ -1209,14 +1406,39 @@ struct ManualAssistPanel: View {
                 Slider(value: $array.manualHoldSeconds, in: 0.5...5.0, step: 0.5)
             }
 
+            Toggle(isOn: $array.manualGuidedAdvance) {
+                Text("Guided auto-advance (fullscreen jumps to the next camera on match)")
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.ink2)
+            }
+            .toggleStyle(.switch)
+            .tint(Theme.accent)
+
+            if array.manualGuidedAdvance {
+                manualConfigRow("Settle before advance",
+                                String(format: "%.1fs", array.manualAdvanceDwellSeconds)) {
+                    Slider(value: $array.manualAdvanceDwellSeconds, in: 1...10, step: 0.5)
+                }
+            }
+
             HStack(spacing: 8) {
                 switch array.manualPhase {
-                case .preparing, .trimming:
+                case .preparing:
+                    Button("Abort & Restore") { array.abortManualMatch() }
+                        .buttonStyle(DarkButtonStyle(destructive: true))
+                case .trimming:
+                    // Report is always available while matching — even if the
+                    // array never reaches an all-green "complete" (e.g. one
+                    // camera intentionally at a different exposure).
+                    Button("Report & Restore") { array.finishManualMatchReport() }
+                        .buttonStyle(DarkButtonStyle(prominent: true))
                     Button("Abort & Restore") { array.abortManualMatch() }
                         .buttonStyle(DarkButtonStyle(destructive: true))
                 case .complete:
-                    Button("Finish & Restore") { array.finishManualMatch() }
+                    Button("Report & Restore") { array.finishManualMatchReport() }
                         .buttonStyle(DarkButtonStyle(prominent: true))
+                    Button("Restore only") { array.finishManualMatch() }
+                        .buttonStyle(DarkButtonStyle())
                     Button("Abort") { array.abortManualMatch() }
                         .buttonStyle(DarkButtonStyle(destructive: true))
                 case .restoring:

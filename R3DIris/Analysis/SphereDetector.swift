@@ -41,6 +41,24 @@ struct SphereGateResult: Sendable {
     let reason: String
 }
 
+/// Appearance signature of an operator-confirmed sphere, broadcast across the
+/// array so other cameras auto-lock the matching object instead of the
+/// top-vote Hough blob (e.g. flat carpet/tape). These are MATERIAL / VIEWPOINT
+/// properties that transfer between cameras of the same physical sphere under
+/// the same lighting — chromaticity (achromatic gray), interior texture,
+/// angular size, and that a shadow terminator exists. Absolute POSITION does
+/// NOT transfer (no array calibration), and the hero IRE VALUE legitimately
+/// differs per camera (that difference is the exposure error being matched) —
+/// so `heroIRE` is context only, never a target imposed on other cameras.
+struct SphereSignature: Sendable, Equatable {
+    var radiusRatio: Double     // r / normalizationWidth — angular-size prior
+    var chroma: Double          // achromatic distance of the real sphere
+    var interiorStd: Double     // interior luma std (texture) of the real sphere
+    var shadowRatio: Double     // measured terminator strength (dark/bright)
+    var lambertianOK: Bool      // seed passed the falloff expectation
+    var heroIRE: Double?        // reference center IRE (context only, per docs)
+}
+
 struct SphereDetection: Sendable {
     enum Status: String, Sendable {
         case success          // full gate pipeline passed
@@ -55,6 +73,13 @@ struct SphereDetection: Sendable {
     var failureReason: String
     var bufferWidth: Int
     var bufferHeight: Int
+    /// Diagnostics (populated by detect(), for the log): how many Hough
+    /// candidates survived to the gate stage, and the strongest one's support.
+    /// candidateCount == 0 means the Hough stage found nothing (not a gate
+    /// rejection); candidateCount > 0 with status .failed means a gate rejected
+    /// the best candidate — see `gates` for which one and its value.
+    var candidateCount: Int = 0
+    var topSupport: Double = 0
 }
 
 // MARK: - Detector
@@ -102,7 +127,8 @@ enum SphereDetector {
     /// Detect the gray sphere in one live frame.
     /// `prior` (from the tracker) narrows the radius search ±30% and prefers
     /// nearby candidates, mirroring sphere.py's profile-prior behavior.
-    static func detect(in buf: PixelBuffer, prior: SphereROI?) -> SphereDetection {
+    static func detect(in buf: PixelBuffer, prior: SphereROI?,
+                       signature: SphereSignature? = nil) -> SphereDetection {
         let w = buf.width, h = buf.height
         let normW = normalizationWidth(width: w, height: h)
         var rMin = max(6, Int(normW * radiusMinRatio))
@@ -111,6 +137,14 @@ enum SphereDetector {
         if let prior {
             let lo = max(rMin, Int(prior.r * 0.70))
             let hi = min(rMax, Int(prior.r * 1.30))
+            if lo < hi { rMin = lo; rMax = hi }
+        } else if let sig = signature {
+            // No tracker prior yet, but a hero seed told us the angular size —
+            // narrow the radius band so a same-size sphere is preferred over an
+            // arbitrary-size distractor (the carpet/tape latch).
+            let target = sig.radiusRatio * normW
+            let lo = max(rMin, Int(target * 0.70))
+            let hi = min(rMax, Int(target * 1.30))
             if lo < hi { rMin = lo; rMax = hi }
         }
         guard rMin < rMax else {
@@ -121,6 +155,11 @@ enum SphereDetector {
         if candidates.isEmpty {
             return failed("no circle candidates above threshold", buf)
         }
+        // Diagnostics: how many circles the Hough stage proposed, and the best
+        // support. Carried onto every result below so the log can separate
+        // "Hough found nothing" from "a gate rejected the candidate".
+        let candCount = candidates.count
+        let topSup = candidates.map(\.support).max() ?? 0
 
         // Prefer candidates near the prior (sphere.py _prior_score analogue).
         if let prior {
@@ -205,7 +244,23 @@ enum SphereDetector {
                 value: spread,
                 reason: String(format: "spread=%.2f IRE", spread))
             gates.append(gSpread)
-            if !gSpread.passed { lastFailedGates = gates; continue }
+            if !gSpread.passed {
+                // Signature waiver: on a stream whose shading is flattened
+                // (low-Q JPEG, soak finding 2026-07-20) ire_spread collapses to
+                // ~0 and rejects the real sphere. When a hero seed's signature
+                // matches this candidate (achromatic, right texture + size, a
+                // terminator present) we trust the operator-confirmed geometry
+                // over the unreliable spread gate and let it through.
+                let waived = signature.map { matchesSignature(buf, cand, $0, normW: normW) } ?? false
+                if waived {
+                    gates.append(SphereGateResult(
+                        gate: "ire_spread_waived", passed: true, value: spread,
+                        reason: "signature-matched; ire_spread unreliable on this stream"))
+                } else {
+                    lastFailedGates = gates
+                    continue
+                }
+            }
 
             // Gate 5: Interior Stddev
             let std85 = interiorStd(buf, cand.cx, cand.cy, cand.r * 0.85)
@@ -217,7 +272,8 @@ enum SphereDetector {
             gates.append(gStd)
             if !gStd.passed { lastFailedGates = gates; continue }
 
-            return finalize(cand, gates: gates, status: .success, buf)
+            return finalize(cand, gates: gates, status: .success, buf,
+                            candidateCount: candCount, topSupport: topSup)
         }
 
         // Gating-2 pass — evenly-lit spheres with no shadow terminator.
@@ -249,16 +305,52 @@ enum SphereDetector {
                                           reason: "accepted at looser bound ≤0.985"))
             gates.append(gSpread)
             gates.append(gStd)
-            return finalize(cand, gates: gates, status: .successPass2, buf)
+            return finalize(cand, gates: gates, status: .successPass2, buf,
+                            candidateCount: candCount, topSupport: topSup)
         }
 
-        return failed("all candidates failed gate pipeline", buf, gates: lastFailedGates)
+        return failed("all candidates failed gate pipeline", buf, gates: lastFailedGates,
+                      candidateCount: candCount, topSupport: topSup)
     }
 
     /// Measure hero IRE at a known ROI without detection (tracker coasting,
     /// or a future manual-ROI path — same interface either way).
     static func measure(in buf: PixelBuffer, roi: SphereROI) -> Double? {
         heroIRE(buf, roi.cx, roi.cy, roi.r)
+    }
+
+    /// Extract a broadcastable appearance signature from an operator-confirmed
+    /// ROI (the hero seed). Uses the same gate math the detector runs, so a
+    /// matched candidate on another camera reads the same properties.
+    static func profile(at roi: SphereROI, in buf: PixelBuffer) -> SphereSignature {
+        let normW = normalizationWidth(width: buf.width, height: buf.height)
+        let cand = Candidate(cx: roi.cx, cy: roi.cy, r: roi.r, support: 1.0)
+        return SphereSignature(
+            radiusRatio: roi.r / normW,
+            chroma: chromaticityDistance(buf, roi.cx, roi.cy, roi.r),
+            interiorStd: Double(interiorStd(buf, roi.cx, roi.cy, roi.r * 0.85)),
+            shadowRatio: shadowRatio(buf, roi.cx, roi.cy, roi.r),
+            lambertianOK: gateLambertian(buf, cand).passed,
+            heroIRE: heroIRE(buf, roi.cx, roi.cy, roi.r))
+    }
+
+    /// Does `cand` look like the seeded sphere? Material + geometry only —
+    /// achromatic, in-band texture, same angular size, and a terminator at
+    /// least as convex as the seed's. Deliberately excludes ire_spread (the
+    /// gate the signature exists to waive) and position (doesn't transfer).
+    private static func matchesSignature(_ buf: PixelBuffer, _ cand: Candidate,
+                                         _ sig: SphereSignature, normW: Double) -> Bool {
+        let ratio = cand.r / normW
+        guard abs(ratio - sig.radiusRatio) <= 0.30 * max(sig.radiusRatio, 0.02) + 0.01 else { return false }
+        let chroma = chromaticityDistance(buf, cand.cx, cand.cy, cand.r)
+        guard chroma <= max(gateChromaMaxDistance, sig.chroma * 1.5) else { return false }
+        let std = interiorStd(buf, cand.cx, cand.cy, cand.r * 0.85)
+        guard gateStddevMin...gateStddevMax ~= std else { return false }
+        // A real sphere has a shadow terminator; the flat carpet/tape distractor
+        // does not (shadow_ratio ~1). Require convexity no flatter than the seed.
+        let shadow = shadowRatio(buf, cand.cx, cand.cy, cand.r)
+        guard shadow <= gateShadowRatioMaxPass2 else { return false }
+        return true
     }
 
     // MARK: - Candidate generation (gradient-direction-constrained Hough)
@@ -512,13 +604,37 @@ enum SphereDetector {
         return median * 100.0
     }
 
-    /// Bright/dark zone IRE difference at ±0.24r (sphere.py _compute_ire_spread:
-    /// probes disks of radius 0.24·(0.20r) at the offset points).
+    /// Bright/dark zone IRE difference (sphere.py _compute_ire_spread).
+    ///
+    /// The R3DMatch probe geometry samples disks of radius 0.24·(0.20r) ≈ 0.048r.
+    /// On R3DMatch's full-res renders the sphere is large, so that's several
+    /// pixels; on the downscaled livestream the sphere is ~16–18px, making the
+    /// probe SUB-PIXEL (~0.8px) — heroIRE can't gather its ≥4 samples, returns
+    /// nil, and the spread reads a structural 0. That rejected the real sphere
+    /// 1424× (100% of ire_spread failures were exactly 0.00) in the 2026-07-21
+    /// soak. Fix is measurability, NOT threshold: floor the probe to stay multi-
+    /// pixel and widen the offset so the two halves stay separated. A genuinely
+    /// flat chart still reads ~0 and is still rejected by the ≥0.8 gate.
     private static func ireSpread(_ buf: PixelBuffer, _ cx: Double, _ cy: Double, _ r: Double) -> Double {
-        let offset = 0.24 * r
-        guard let bright = heroIRE(buf, cx + offset, cy, r * 0.20),
-              let dark = heroIRE(buf, cx - offset, cy, r * 0.20) else { return 0 }
+        let offset = max(3.0, 0.30 * r)
+        let probeR = max(2.5, 0.15 * r)
+        guard let bright = zoneMedianIRE(buf, cx + offset, cy, probeR),
+              let dark = zoneMedianIRE(buf, cx - offset, cy, probeR) else { return 0 }
         return abs(bright - dark)
+    }
+
+    /// Median IRE (×100) over a disk of the given PIXEL radius; drops zeros and
+    /// needs ≥4 samples. Direct-radius sibling of heroIRE (which scales by 0.24),
+    /// used where a pixel-floored probe matters on small livestream spheres.
+    private static func zoneMedianIRE(_ buf: PixelBuffer, _ cx: Double, _ cy: Double, _ pr: Double) -> Double? {
+        var vals: [Float] = []
+        forEachDiskPixel(buf, cx, cy, pr) { i in
+            let v = buf.luma[i]
+            if v > 0 { vals.append(v) }
+        }
+        guard vals.count >= 4 else { return nil }
+        vals.sort()
+        return Double(vals[vals.count / 2]) * 100.0
     }
 
     // MARK: - Pixel iteration helpers
@@ -548,7 +664,8 @@ enum SphereDetector {
     // MARK: - Result builders
 
     private static func finalize(_ cand: Candidate, gates: [SphereGateResult],
-                                 status: SphereDetection.Status, _ buf: PixelBuffer) -> SphereDetection {
+                                 status: SphereDetection.Status, _ buf: PixelBuffer,
+                                 candidateCount: Int = 0, topSupport: Double = 0) -> SphereDetection {
         // Limb-snap: the Hough center drifts toward the LIT side whenever the
         // shadow-side limb fades into a dark backdrop (half the boundary casts
         // no votes) — the classic symptom is a small circle hugging the
@@ -559,7 +676,8 @@ enum SphereDetector {
             status: status, roi: roi,
             heroIRE: heroIRE(buf, roi.cx, roi.cy, roi.r),
             gates: gates, failureReason: "",
-            bufferWidth: buf.width, bufferHeight: buf.height)
+            bufferWidth: buf.width, bufferHeight: buf.height,
+            candidateCount: candidateCount, topSupport: topSupport)
     }
 
     // MARK: - Limb-snap refinement
@@ -680,9 +798,11 @@ enum SphereDetector {
     }
 
     private static func failed(_ reason: String, _ buf: PixelBuffer,
-                               gates: [SphereGateResult] = []) -> SphereDetection {
+                               gates: [SphereGateResult] = [],
+                               candidateCount: Int = 0, topSupport: Double = 0) -> SphereDetection {
         SphereDetection(status: .failed, roi: nil, heroIRE: nil, gates: gates,
                         failureReason: reason,
-                        bufferWidth: buf.width, bufferHeight: buf.height)
+                        bufferWidth: buf.width, bufferHeight: buf.height,
+                        candidateCount: candidateCount, topSupport: topSupport)
     }
 }

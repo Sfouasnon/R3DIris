@@ -26,6 +26,10 @@ struct SphereState: Sendable, Equatable {
     var heroIRE: Double? = nil
     var measuredAt: Date? = nil
     var detail: String = ""
+    /// Operator-seeded lock (click-to-seed). A human confirmed the sphere, so
+    /// the track is not dropped on detection misses — it coasts indefinitely,
+    /// measuring at the seeded ROI, until an explicit re-detect or a new seed.
+    var seeded: Bool = false
 
     var hasROI: Bool { phase == .locked || phase == .coasting || phase == .candidate }
     /// The loop only trusts a locked (or briefly coasting) sphere.
@@ -65,6 +69,18 @@ struct SphereTracker {
             let near = state.hasROI &&
                 hypot(nx - state.cx, ny - state.cy) <= state.r * Self.matchDistanceRatio
 
+            // An operator-approved lock is FROZEN: the human placed and sized
+            // it, so no detection — near or far — moves its geometry. Refresh
+            // the hero measurement only and stay locked (no EMA drift).
+            if state.seeded {
+                misses = 0
+                state.phase = .locked
+                state.heroIRE = det.heroIRE ?? state.heroIRE
+                if det.heroIRE != nil { state.measuredAt = Date() }
+                state.detail = "locked (operator seed)"
+                return
+            }
+
             if near || !state.hasROI {
                 hits = near ? hits + 1 : 1
             } else {
@@ -91,28 +107,44 @@ struct SphereTracker {
             }
 
         case .coasting:
-            // Detection failed but the caller measured at the locked ROI.
-            misses += 1
+            // Detection failed (or was skipped) but the caller measured at the
+            // locked ROI.
             if state.phase == .locked || state.phase == .coasting {
-                state.phase = misses >= Self.missesToUnlock ? .searching : .coasting
-                if state.phase == .searching {
-                    reset(detail: "lock lost (\(misses) misses)")
-                } else {
+                if state.seeded {
+                    // Frozen operator lock: refresh the measurement, stay locked
+                    // at the fixed ROI, never time out.
+                    misses = 0
+                    state.phase = .locked
                     state.heroIRE = det.heroIRE ?? state.heroIRE
                     if det.heroIRE != nil { state.measuredAt = Date() }
-                    state.detail = "coasting (\(misses))"
+                    state.detail = "locked (operator seed)"
+                } else {
+                    misses += 1
+                    state.phase = misses >= Self.missesToUnlock ? .searching : .coasting
+                    if state.phase == .searching {
+                        reset(detail: "lock lost (\(misses) misses)")
+                    } else {
+                        state.heroIRE = det.heroIRE ?? state.heroIRE
+                        if det.heroIRE != nil { state.measuredAt = Date() }
+                        state.detail = "coasting (\(misses))"
+                    }
                 }
             }
 
         case .failed:
-            misses += 1
             switch state.phase {
             case .locked, .coasting:
-                if misses >= Self.missesToUnlock {
-                    reset(detail: "lock lost (\(misses) misses)")
+                if state.seeded {
+                    state.phase = .locked
+                    state.detail = "locked (operator seed)"
                 } else {
-                    state.phase = .coasting
-                    state.detail = "coasting (\(misses))"
+                    misses += 1
+                    if misses >= Self.missesToUnlock {
+                        reset(detail: "lock lost (\(misses) misses)")
+                    } else {
+                        state.phase = .coasting
+                        state.detail = "coasting (\(misses))"
+                    }
                 }
             case .candidate:
                 reset(detail: det.failureReason)
@@ -129,6 +161,50 @@ struct SphereTracker {
         return SphereROI(cx: state.cx * Double(w),
                          cy: state.cy * Double(h),
                          r: state.r * Double(w))
+    }
+
+    /// Force a locked track from an operator click-to-seed (normalized coords).
+    /// The human is the confirmation the 3-consecutive-hit persistence gate was
+    /// standing in for, so this bypasses temporal persistence entirely and the
+    /// lock then holds through detection misses (see `seeded`).
+    mutating func manualLock(cx: Double, cy: Double, r: Double, heroIRE: Double?) {
+        hits = Self.hitsToLock
+        misses = 0
+        state.phase = .locked
+        state.cx = cx
+        state.cy = cy
+        state.r = r
+        state.heroIRE = heroIRE
+        state.measuredAt = Date()
+        state.seeded = true
+        state.detail = "locked (operator seed)"
+    }
+
+    /// Promote the current auto-lock to a FROZEN (operator-equivalent) lock so a
+    /// deliberate monitor-transform swap can't unlock the mask via appearance
+    /// gates. On the flat/desaturated Log3G10 look, Hough detection fails and a
+    /// non-seeded track coasts, then times out (~3 s); the sphere never moved, so
+    /// freeze it in place and keep measuring hero IRE at the fixed ROI. Returns
+    /// true only if this call newly froze the track, so the caller can reverse it
+    /// (an already-seeded operator lock is left untouched and not reported).
+    @discardableResult
+    mutating func freezeAtCurrentLock() -> Bool {
+        guard state.phase == .locked || state.phase == .coasting, !state.seeded else { return false }
+        misses = 0
+        state.phase = .locked
+        state.seeded = true
+        state.detail = "locked (frozen for transform)"
+        return true
+    }
+
+    /// Reverse freezeAtCurrentLock(): drop back to normal persistence tracking
+    /// while staying locked. No-op if the track isn't frozen.
+    mutating func unfreeze() {
+        guard state.seeded else { return }
+        state.seeded = false
+        hits = Self.hitsToLock
+        misses = 0
+        state.detail = "locked"
     }
 
     mutating func reset(detail: String = "") {

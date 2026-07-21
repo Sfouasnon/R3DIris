@@ -118,7 +118,7 @@ actor CameraActor {
                 connectFails = 0
                 lastSeen = Date()
                 publish()
-                log("connected (\(status.name.isEmpty ? ip : status.name), FW \(status.firmware))")
+                log("connected (\(status.displayID.isEmpty ? ip : status.displayID), FW \(status.firmware))")
                 let watchdog = Task { await self.watchdogLoop() }
                 await consumer.value          // returns when the socket dies/closes
                 watchdog.cancel()
@@ -189,6 +189,21 @@ actor CameraActor {
         let info = await sendAndWait(["type": "rcp_get", "id": "CAMERA_INFO"],
                                      replyKeys: ["rcp_cur_cam_info"], timeout: 5)
         applyCameraInfo(info)
+        // Array identifier (e.g. "GC") = reel letter + clip letter from the
+        // clip name ("G001_C001" → "GC"). CLIP_NAME_2 is the live param but is
+        // get-only (no subscribe); CLIP_NAME is the deprecated fallback. Log the
+        // raw value + derived id so a body sending an odd shape is diagnosable.
+        for idParam in ["CLIP_NAME_2", "CLIP_NAME"] {
+            let reply = await sendAndWait(["type": "rcp_get", "id": idParam],
+                                          replyKeys: ["rcp_cur_str", "rcp_cur_int"], timeout: 3)
+            if let raw = RCP2.extractString(reply), !raw.isEmpty {
+                status.clipName = raw
+                log("\(idParam) = \(raw) → id \(status.rcpIdentifier.isEmpty ? "(no 2-letter match)" : status.rcpIdentifier)")
+                break
+            } else {
+                log("\(idParam) = (empty)")
+            }
+        }
         let params = await sendAndWait(["type": "rcp_get_parameters"],
                                        replyKeys: ["rcp_cur_parameters"], timeout: 5)
         if let list = params?["parameters"] as? [Any] {
@@ -352,17 +367,49 @@ actor CameraActor {
 
     /// LIVESTREAM_QUALITY 1–4 → Q25/Q50/Q75/Q100. Measure at Q100 — JPEG
     /// compression perturbs patch statistics at low Q (LIVESTREAM_NOTES).
+    ///
+    /// Returns true only when the camera READS BACK the value we set.
+    /// LIVESTREAM_QUALITY is not a subscribed param, so the camera never pushes
+    /// it — without this read-back a silently-held Q25 is indistinguishable
+    /// from an accepted Q100, which is exactly how a 40-camera array corrupts a
+    /// match with no signal (soak finding 2026-07-20). The verify read mirrors
+    /// setMonitorDisplayPreset's rule-10 one-off unsubscribe discipline.
+    @discardableResult
     func setLivestreamQuality(_ q: Int) async -> Bool {
         guard let session else { return false }
-        log("rcp_set LIVESTREAM_QUALITY \(q) (\(RCP2.livestreamQualityLabels[q] ?? "?"))")
+
+        // The valid quality factors are context-dependent — LIVESTREAM_QUALITY
+        // supports rcp_get_list, and real bodies clamp Q100 at some stream
+        // configs (bench 2026-07-20: set Q100, camera held Q50/Q25). Ask the
+        // camera which factors it currently allows, and target the best one
+        // ≤ requested, so a silent clamp becomes a reported result.
+        let listReply = await sendAndWait(["type": "rcp_get_list", "id": RCP2.livestreamQualityParam],
+                                          replyKeys: ["rcp_cur_list"], timeout: 2)
+        let allowed = RCP2.extractIntList(listReply)
+        var target = q
+        if !allowed.isEmpty, !allowed.contains(q) {
+            target = allowed.filter { $0 <= q }.max() ?? allowed.min() ?? q
+            log("LIVESTREAM_QUALITY \(RCP2.livestreamQualityLabels[q] ?? "\(q)") not available (camera allows: \(allowed.map { RCP2.livestreamQualityLabels[$0] ?? "\($0)" }.joined(separator: " "))) — using \(RCP2.livestreamQualityLabels[target] ?? "\(target)")")
+        }
+
+        log("rcp_set LIVESTREAM_QUALITY \(target) (\(RCP2.livestreamQualityLabels[target] ?? "?"))")
         do {
-            try await session.send(["type": "rcp_set", "id": RCP2.livestreamQualityParam, "value": q])
-            return true
+            try await session.send(["type": "rcp_set", "id": RCP2.livestreamQualityParam, "value": target])
         } catch {
             status.lastError = String(describing: error)
             publish()
             return false
         }
+
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        unsubscribed.remove(RCP2.livestreamQualityParam)
+        let verify = await benchGet(RCP2.livestreamQualityParam)
+        let readBack = RCP2.extractInt(verify)
+        if let readBack { status.livestreamQuality = readBack; publish() }
+        let confirmed = (readBack == target)
+        let seen = readBack.map { RCP2.livestreamQualityLabels[$0] ?? "\($0)" } ?? "no reply"
+        log("LIVESTREAM_QUALITY \(confirmed ? "CONFIRMED at \(RCP2.livestreamQualityLabels[target] ?? "\(target)")" : "NOT CONFIRMED — set \(RCP2.livestreamQualityLabels[target] ?? "\(target)"), camera reports \(seen)")")
+        return confirmed
     }
 
     // MARK: Monitor viewing transform (rule 11; # UNVERIFIED)
@@ -422,6 +469,23 @@ actor CameraActor {
                                              reason: "set Log3G10")
     }
 
+    /// Read a monitor param's current value (cur, else target). Used to capture
+    /// a specific output's Look before the operator-chosen Log3G10 swap.
+    func monitorParamValue(_ pid: String) async -> Int? {
+        unsubscribed.remove(pid)
+        let msg = await benchGet(pid)
+        let (cur, target) = RCP2.extractCurTarget(msg)
+        return cur ?? target ?? RCP2.extractInt(msg)
+    }
+
+    /// Restore a saved Look on its exact param (unconditional — used by the
+    /// explicit LCD/SDI swap, which knows precisely what it changed).
+    func restoreColorSetting(_ saved: MonitorTransformReading) async -> Bool {
+        guard !saved.parameterID.isEmpty, let v = saved.presetValue else { return true }
+        return await setMonitorDisplayPreset(parameterID: saved.parameterID, value: v,
+                                             reason: "restore Look")
+    }
+
     /// Set one known monitor-output preset and verify its readback. This is
     /// shared by the explicit Log3G10 action and Manual Assist's reversible
     /// output transaction; it never touches record-side color/gamma settings.
@@ -453,14 +517,20 @@ actor CameraActor {
         // one-off unsubscribe discipline for the verification read (rule 10).
         unsubscribed.remove(pid)
         let verify = await benchGet(pid)
-        let confirmed = RCP2.extractInt(verify) == value
+        // DISPLAY_PRESET_* are "Value (with target)" params (KOMODO-X PDF): a SET
+        // moves TARGET immediately while CUR transitions over a few frames.
+        // Confirm against the target (the commanded value) — reading cur alone
+        // races the transition and false-fails (bench 2026-07-20).
+        let (cur, target) = RCP2.extractCurTarget(verify)
+        let readVal = target ?? cur ?? RCP2.extractInt(verify)
+        let confirmed = (readVal == value)
         if confirmed {
             status.monitorTransformParam = pid
             status.monitorTransformValue = value
             status.monitorTransformSeenAt = Date()
             publish()
         }
-        log("\(reason): \(confirmed ? "CONFIRMED" : "NOT CONFIRMED") on \(pid) = \(value) (\(label))")
+        log("\(reason): \(confirmed ? "CONFIRMED" : "NOT CONFIRMED — camera reports \(readVal.map(String.init) ?? "no value")") on \(pid) = \(value) (\(label))")
         return confirmed
     }
 
@@ -521,6 +591,16 @@ actor CameraActor {
             if RCP2.looksLikeTC(tc) {
                 status.currentTC = tc
                 status.tcSeenAt = Date()
+            }
+        case "CLIP_NAME_2", "CLIP_NAME":
+            // The array identifier (GA/GB) is derived from the clip name, not
+            // CAMERA_ID — matching REDConductorV3. CLIP_NAME_2 is the live param
+            // (CLIP_NAME is deprecated). Log the first value so a body that
+            // sends an unexpected shape is diagnosable.
+            let s = RCP2.extractDisplay(msg)
+            if !s.isEmpty, s != status.clipName {
+                status.clipName = s
+                log("clip name = \(s) → id \(status.rcpIdentifier.isEmpty ? "(no 2-letter match)" : status.rcpIdentifier)")
             }
         case RCP2.apertureParam:
             // Value-with-target: cur = where the iris is, target = where it's

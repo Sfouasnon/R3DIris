@@ -39,6 +39,13 @@ final class ArrayController: ObservableObject {
 
     var fullScreenNode: CameraNode? { nodes.first { $0.id == fullScreenNodeID } }
 
+    /// When on, unseeded cameras log a throttled detector diagnostic (Hough
+    /// candidate count + support + gate ladder). Pushed to every node so it
+    /// applies to auto-solving spheres you leave un-seeded.
+    @Published var logSphereDiagnostics = false {
+        didSet { for n in nodes { n.diagnosticsEnabled = logSphereDiagnostics } }
+    }
+
     // MARK: Discovery (V3's method, ported: TCP subnet sweep on :9998 primary,
     // UDP CAMINFO broadcast fallback — both spend ZERO camera session slots.
     // Manual IP entry remains as the fallback path.)
@@ -46,6 +53,13 @@ final class ArrayController: ObservableObject {
     @Published var subnet: String = ""         // CIDR / bare / shorthand (Subnet.hosts)
     @Published private(set) var discovering = false
     @Published private(set) var discovered: [DiscoveredCamera] = []
+
+    // MARK: Livestream quality (array-wide)
+    // Q100 default: low-Q JPEG flattens the sphere's shading gradient, which
+    // collapses ire_spread to ~0 and blocks lock (soak finding 2026-07-20).
+    // Every push is read-back verified per body (CameraActor). Drop it only if
+    // viewing many streams strains the GigE segment — LIVESTREAM_NOTES ch.7.
+    @Published var arrayQuality: Int = 4   // 1=Q25 2=Q50 3=Q75 4=Q100
 
     var subnetHostCount: Int { Subnet.hosts(from: subnet).count }
 
@@ -72,11 +86,11 @@ final class ArrayController: ObservableObject {
     @Published var referenceMode: ReferenceMode = .median
     @Published var loopTargetText: String = String(format: "%.1f", Log3G10.grayAnchorIRE)
 
-    /// 18% gray's approximate IRE through the IPP2/SDR display path —
-    /// operator-supplied working value ("41–43 in IPP2"; Stephen 2026-07-17).
-    /// # PROVISIONAL: refine on the bench against a metered gray sphere.
-    /// The Log3G10 anchor (33.3) is exact; this one is display-path-dependent.
-    static let ipp2GrayAnchorIRE = 42.0
+    /// 18% gray's IRE through the IPP2 display path (medium contrast / medium
+    /// detail) — operator value 42.3 (Stephen 2026-07-20; earlier "41–43").
+    /// # PROVISIONAL: display-path-dependent, refine on the bench against a
+    /// metered gray sphere. The Log3G10 anchor (33.3) is exact; this is not.
+    static let ipp2GrayAnchorIRE = 42.3
 
     var loopCustomTargetIRE: Double? {
         guard let value = Double(loopTargetText.trimmingCharacters(in: .whitespaces)),
@@ -101,10 +115,28 @@ final class ArrayController: ObservableObject {
 
     enum ManualTargetMode: String, CaseIterable, Identifiable {
         case median = "Captured median"
-        case gray18 = "18% gray · 33.3"
+        case gray18 = "18% gray anchor"
         case custom = "Custom IRE"
         var id: String { rawValue }
     }
+
+    /// Monitoring transform the match runs in. Log3G10 (preferred) swaps the
+    /// mirrored outputs to Log3G10 and anchors 18% gray at 33.3 IRE. Display
+    /// leaves the current transform untouched and anchors 18% gray at the IPP2
+    /// value (42.3) — the only workable path when the mirrored output can't
+    /// carry Log3G10 (e.g. the built-in LCD, which rejects the preset).
+    enum ManualTransform: String, CaseIterable, Identifiable {
+        case log3g10 = "Log3G10 (follow stream)"
+        case display = "Display (IPP2)"
+        var id: String { rawValue }
+        var isLog3G10: Bool { self == .log3g10 }
+        // The output whose Look we swap is no longer an operator guess (LCD vs
+        // SDI). Prepare reads each camera's LIVESTREAM_MIRROR_SOURCE and resolves
+        // the exact SDI_COLOR_SETTING param feeding that camera's stream, so the
+        // swap always lands on the output the analyzer actually sees. See
+        // CameraActor.readActiveMonitorTransform().
+    }
+    @Published var manualTransform: ManualTransform = .log3g10
 
     enum ManualSessionPhase: String, Equatable {
         case idle = "idle"
@@ -144,6 +176,39 @@ final class ArrayController: ObservableObject {
     private var manualLastMeasurementAt: [UUID: Date] = [:]
     private var manualSavedTransforms: [UUID: MonitorTransformReading] = [:]
     private var manualChangedOutputs: Set<UUID> = []
+    /// Participants whose masks we froze for the transform swap (reversed on end).
+    private var manualFrozenNodes: Set<UUID> = []
+    /// Single-operator guided flow: after a camera holds a match, focus jumps to
+    /// the next unmatched camera (ID order) in fullscreen, and snaps back to any
+    /// certified camera that later drifts out of tolerance.
+    @Published var manualGuidedAdvance = true
+    /// How long the focused camera must stay continuously matched before focus
+    /// advances — breathing room to settle onto the true target with small
+    /// re-adjustments instead of jumping the instant it first reads matched.
+    @Published var manualAdvanceDwellSeconds: Double = 4.0
+    /// When the focused camera began its current unbroken matched stretch (nil
+    /// whenever it isn't matched). Drives the advance dwell.
+    private var manualFocusDwellSince: Date?
+    /// Cameras that have reached a held match and not since drifted out.
+    private var manualCertified: Set<UUID> = []
+    /// True once a session actually reached the Log3G10 transform stage. Lets the
+    /// end message distinguish "nothing needed changing" from "blocked before we
+    /// touched any output" (which must NOT claim the outputs are in Log3G10).
+    private var manualEnteredTransformStage = false
+
+    /// Stable ID-order key for guided advance (GA < GB < …; ip as a fallback).
+    private func manualIDKey(_ node: CameraNode) -> String {
+        node.status.displayID.isEmpty ? node.ip : node.status.displayID
+    }
+
+    /// Move fullscreen focus (and selection) to a camera during the guided flow.
+    private func focusManual(on node: CameraNode) {
+        guard fullScreenNodeID != node.id else { return }
+        fullScreenNodeID = node.id
+        selectedNodeID = node.id
+        manualFocusDwellSince = nil   // new camera starts its dwell fresh
+        log("manual match: focus → \(manualIDKey(node))")
+    }
     private var manualEndRequested = false
     private var manualEndMessage = "Manual Assist aborted by operator."
     private var manualEndWasFailure = false
@@ -152,26 +217,98 @@ final class ArrayController: ObservableObject {
     static let measureTimeout: TimeInterval = 6
     static let maxRounds = 16
 
+    // MARK: - Stream auto-recovery
+    /// Automatically restart a participant's livestream if it drops or stalls.
+    /// Long matches outlive the MJPEG feed (idle timeout / transient network), and
+    /// a 36-camera calibration must not depend on someone noticing a dead tile.
+    @Published var autoRecoverStreams = true
+    private var streamRetryCount: [UUID: Int] = [:]
+    private var watchdogTask: Task<Void, Never>?
+    /// A stream must be silent for this long before it's considered dead — well
+    /// past normal frame jitter at ~20 fps.
+    private static let streamStallTimeout: TimeInterval = 8.0
+    /// And we never touch a stream until this long after it (re)started, so the
+    /// enable delay and first-frame settle can never look like a stall. This also
+    /// spaces retries: a still-dead camera is only restarted once per grace.
+    private static let streamStartGrace: TimeInterval = 10.0
+
     init() {
         soak.onLog = { [weak self] line in self?.log(line) }
         soak.onDurationReached = { [weak self] in
             self?.stopSoak(reason: "duration reached")
         }
+        startStreamWatchdog()
+    }
+
+    private func startStreamWatchdog() {
+        watchdogTask?.cancel()
+        watchdogTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)   // 0.5 Hz — gentle
+                guard let self else { return }
+                self.recoverDeadStreams()
+            }
+        }
+    }
+
+    /// Restart the livestream on a camera that is *supposed* to be streaming but
+    /// has genuinely gone dead. Deliberately conservative so it never fights
+    /// normal startup or a healthy feed:
+    ///   • only nodes with `streamingDesired`,
+    ///   • only once the stream is `streamStartGrace` past its last (re)start
+    ///     (so the ~0.7 s enable delay and first-frame settle are never a "stall"),
+    ///   • dead = no frame for `streamStallTimeout` (or none ever, past grace),
+    ///     or the reader reported a hard drop / frozen feed.
+    /// Because a restart resets `lastStreamStartAt`, the grace also spaces retries
+    /// (~one attempt per 10 s) — no separate backoff needed. Touches only the
+    /// livestream: never seeds, masks, or the Log3G10 swap.
+    func recoverDeadStreams() {
+        guard autoRecoverStreams else { return }
+        let now = Date()
+        for node in nodes where node.connected && node.streamingDesired {
+            // Still inside the post-(re)start settle window — leave it alone.
+            if let started = node.lastStreamStartAt,
+               now.timeIntervalSince(started) < Self.streamStartGrace { continue }
+
+            let last = node.stream.stats.lastFrameAt
+            let dead: Bool
+            if let last {
+                // Delivered frames before; dead only if they've stopped for a while
+                // (a hard drop / frozen feed also means frames have stopped).
+                dead = now.timeIntervalSince(last) > Self.streamStallTimeout
+                    || !node.stream.isStreaming || node.streamStale
+            } else {
+                // Never delivered a frame and grace has elapsed — it's not coming.
+                dead = true
+            }
+
+            if dead {
+                let attempt = (streamRetryCount[node.id] ?? 0) + 1
+                streamRetryCount[node.id] = attempt
+                node.startStream()   // resets lastStreamStartAt → next attempt ≥ grace away
+                log("auto-recover: \(node.ip) livestream dead — restart (attempt \(attempt))")
+            } else if streamRetryCount[node.id] != nil {
+                streamRetryCount[node.id] = nil   // healthy again
+            }
+        }
     }
 
     // MARK: - Discovery
 
-    /// PRIMARY: TCP-sweep on :9998 (V1/V2.1's proven method). With an EMPTY
-    /// subnet field the sweep targets are AUTO-DETECTED from this Mac's own
-    /// interfaces (RED Control Pro-style zero-config — the operator never
-    /// types network numbers unless the auto sweep comes up dry; the field
-    /// remains the manual override for routed/odd topologies).
-    /// FALLBACK: UDP CAMINFO broadcast when every sweep is empty.
-    /// Already-added bodies are skipped (rule 2 — never touch a live session).
+    /// Zero-config discovery. PRIMARY is the RCP-native CAMINFO broadcast on
+    /// UDP :1112 (field-notes rule 15) — subnet-agnostic, so it finds cameras
+    /// across the L2 segment even when the swept /24 is wrong — bound to each
+    /// detected interface so it egresses the right NIC (rule 16). The TCP
+    /// :9998 connect-sweep FILLS IN cameras on UDP-blocked segments (a bare
+    /// connect never upgrades to a WS → zero session slots). Both are merged.
+    /// With an EMPTY subnet field the sweep targets are AUTO-DETECTED from this
+    /// Mac's own interfaces; a non-empty field is a manual override — but a
+    /// value that is a netmask or expands to no hosts is IGNORED (it would
+    /// otherwise sweep a dead range and disable auto-detect, array-log finding
+    /// 2026-07-20). Already-added bodies are skipped (rule 2).
     func discover() {
         guard !discovering else { return }
         discovering = true
-        let manualCIDR = subnet.trimmingCharacters(in: .whitespaces)
         let source = sourceIP.trimmingCharacters(in: .whitespaces)
         var src = source.isEmpty ? nil : source
         // Guard: a source IP this Mac doesn't own binds every probe to a
@@ -181,30 +318,67 @@ final class ArrayController: ObservableObject {
             log("discovery: source IP \(candidate) is not an address on this Mac — IGNORING it for this sweep (rule 16 wants one of YOUR interface addresses, not the camera subnet)")
             src = nil
         }
+
+        // Validate the manual subnet field. A netmask (255.255.255.0) or any
+        // value that expands to no usable hosts must NOT be swept as a network:
+        // it scans a dead range AND, because the field is non-empty, silently
+        // disables the zero-config auto-detect that would have found the real
+        // subnet (array-log finding 2026-07-20). Warn and fall through to auto.
+        var manualCIDR = subnet.trimmingCharacters(in: .whitespaces)
+        if !manualCIDR.isEmpty {
+            if Subnet.looksLikeMask(manualCIDR) {
+                log("discovery: subnet field \"\(manualCIDR)\" is a NETMASK, not a network — IGNORING it and auto-detecting instead (enter a subnet like 172.20.114.0/24, or leave it blank)")
+                manualCIDR = ""
+            } else if Subnet.hosts(from: manualCIDR).isEmpty {
+                log("discovery: subnet field \"\(manualCIDR)\" expands to no usable hosts — IGNORING it and auto-detecting instead")
+                manualCIDR = ""
+            }
+        }
+
         let known = Set(nodes.map(\.ip))
         Task {
+            // Sweep targets + the interface source IPs to bind the broadcast to.
             var targets: [String] = []
+            var broadcastSources: [String?] = []
             if manualCIDR.isEmpty {
                 let detected = LocalSubnets.detect()
                 targets = detected.map(\.cidr)
+                broadcastSources = detected.map { Optional($0.address) }
                 if detected.isEmpty {
-                    log("discovery: no local IPv4 subnets detected — CAMINFO broadcast only")
+                    log("discovery: no local IPv4 subnets detected — CAMINFO broadcast on the default route only")
                 } else {
                     log("discovery: auto-detected " + detected.map {
-                        "\($0.cidr) (\($0.interface), \($0.hostCount) hosts)"
+                        "\($0.cidr) (\($0.interface) \($0.address), \($0.hostCount) hosts)"
                     }.joined(separator: ", ") + " — wide masks clamped to /24 around this host")
                 }
             } else {
                 targets = [manualCIDR]
             }
+            // An explicit, validated source IP overrides per-interface binding.
+            let bcastSources: [String?] = src != nil ? [src] : (broadcastSources.isEmpty ? [nil] : broadcastSources)
 
             var found: [DiscoveredCamera] = []
-            for cidr in targets {
-                log("discovery: TCP sweep \(cidr) :9998 (\(Subnet.hosts(from: cidr).count) hosts)")
-                let hits = await TCPScan.discover(cidr: cidr, sourceIP: src,
-                                                  skip: known.union(found.map(\.ip)))
-                found.append(contentsOf: hits)
+            func merge(_ cams: [DiscoveredCamera]) {
+                for c in cams where !known.contains(c.ip) && !found.contains(where: { $0.ip == c.ip }) {
+                    found.append(c)
+                }
             }
+
+            // 1) RCP-native CAMINFO broadcast FIRST (rule 15), per interface.
+            for bsrc in bcastSources {
+                log("discovery: CAMINFO broadcast\(bsrc.map { " via \($0)" } ?? "")")
+                merge(await UDPDiscovery.discover(sourceIP: bsrc))
+            }
+
+            // 2) TCP :9998 sweep fills in UDP-blocked segments.
+            for cidr in targets {
+                let n = Subnet.hosts(from: cidr).count
+                guard n > 0 else { continue }
+                log("discovery: TCP sweep \(cidr) :9998 (\(n) hosts)")
+                merge(await TCPScan.discover(cidr: cidr, sourceIP: src,
+                                             skip: known.union(found.map(\.ip))))
+            }
+
             // Sim convenience: a :9998 listener on plain 127.0.0.1 is always
             // the simulator (real bodies never live there) — one free probe
             // makes the no-sudo single-sim case zero-config too.
@@ -213,14 +387,10 @@ final class ArrayController: ObservableObject {
                                                      skip: known.union(found.map(\.ip)))
                 if !simHits.isEmpty {
                     log("discovery: simulator detected on 127.0.0.1")
-                    found.append(contentsOf: simHits)
+                    merge(simHits)
                 }
             }
-            if found.isEmpty {
-                log("discovery: CAMINFO broadcast\(targets.isEmpty ? "" : " fallback")")
-                let udp = await UDPDiscovery.discover(sourceIP: src)
-                found = udp.filter { !known.contains($0.ip) }
-            }
+
             discovered = found
             discovering = false
             log("discovery: \(found.count) new camera(s)")
@@ -238,6 +408,70 @@ final class ArrayController: ObservableObject {
     }
 
     func dismissDiscovered() { discovered.removeAll() }
+
+    // MARK: - Livestream quality
+
+    /// Push the array-wide quality to every connected body, read-back verified
+    /// per camera (CameraActor logs any that don't echo the value).
+    func setQualityAll() {
+        let q = arrayQuality
+        log("array quality: LIVESTREAM_QUALITY \(q) (\(RCP2.livestreamQualityLabels[q] ?? "?")) → \(nodes.count) camera(s), verified per body")
+        for node in nodes { node.applyQuality(q) }
+    }
+
+    // MARK: - Sphere seeding (operator click → array-wide signature)
+
+    /// The operator clicked the sphere center on `node` (normalized frame
+    /// coords). Begin a PENDING mask the operator sizes and approves — nothing
+    /// locks or broadcasts until Approve (see `approveSeed`).
+    func seedSphere(_ node: CameraNode, normX: Double, normY: Double) {
+        let nx = min(max(normX, 0), 1), ny = min(max(normY, 0), 1)
+        node.beginSeed(normX: nx, normY: ny)
+        log("seed: \(node.displayName) center @ (\(String(format: "%.3f", nx)), \(String(format: "%.3f", ny))) — size the mask, then Approve")
+    }
+
+    /// Approve the pending mask on `node`: lock it and broadcast its sphere
+    /// signature to the rest of the array so the others auto-lock the matching
+    /// object instead of the top-vote blob.
+    func approveSeed(_ node: CameraNode) {
+        guard let signature = node.approveSeed() else {
+            log("seed: nothing to approve on \(node.displayName)")
+            return
+        }
+        broadcastSeedSignature(signature, from: node, verb: "approved")
+    }
+
+    /// One-click accept of a camera's current auto-detected mask (from the tile,
+    /// no fullscreen). Freezes it as the seed and broadcasts the signature.
+    func acceptAutoMask(_ node: CameraNode) {
+        guard let signature = node.acceptCurrentMask() else {
+            log("seed: no mask to accept on \(node.displayName)")
+            return
+        }
+        broadcastSeedSignature(signature, from: node, verb: "auto-mask accepted")
+    }
+
+    private func broadcastSeedSignature(_ signature: SphereSignature, from node: CameraNode, verb: String) {
+        var applied = 0
+        for other in nodes where other.id != node.id {
+            other.applySignature(signature)
+            applied += 1
+        }
+        log("seed: \(node.displayName) \(verb) — signature (r/w=\(String(format: "%.3f", signature.radiusRatio)), chroma=\(String(format: "%.4f", signature.chroma))) to \(applied) other camera(s)")
+    }
+
+    /// Cycle the fullscreen camera to the next/prev body in ID order — hands-free
+    /// seeding without minimize + double-click. delta +1 = next, -1 = previous.
+    func fullscreenStep(_ delta: Int) {
+        guard let current = fullScreenNodeID, !nodes.isEmpty else { return }
+        let ordered = nodes.sorted { manualIDKey($0) < manualIDKey($1) }
+        guard let idx = ordered.firstIndex(where: { $0.id == current }) else { return }
+        let next = ordered[(idx + delta + ordered.count) % ordered.count]
+        fullScreenNodeID = next.id
+        selectedNodeID = next.id
+    }
+
+    func cancelSeed(_ node: CameraNode) { node.cancelSeed() }
 
     // MARK: - Membership
 
@@ -258,10 +492,18 @@ final class ArrayController: ObservableObject {
         guard !nodes.contains(where: { $0.ip == ip }) else { return }
         let node = CameraNode(ip: ip)
         node.onLog = { [weak self] line in self?.log(line) }
+        node.diagnosticsEnabled = logSphereDiagnostics
         if soak.isRecording { node.attachSoakRecorder(soak) }
         nodes.append(node)
         if selectedNodeID == nil { selectedNodeID = node.id }
         log("added \(ip)\(label.isEmpty ? "" : " (\(label))")")
+        // Auto-connect on add so the array comes up hands-free — discovered or
+        // manual, no separate Connect All step. Manual Assist owns reversible
+        // output state, so never open new sessions mid-session (rule 2/11).
+        if !manualSessionActive {
+            let src = sourceIP.trimmingCharacters(in: .whitespaces)
+            node.connect(sourceIP: src.isEmpty ? nil : src)
+        }
     }
 
     func removeCamera(_ node: CameraNode) {
@@ -280,7 +522,16 @@ final class ArrayController: ObservableObject {
     func connectAll() {
         guard !manualSessionActive else { return }
         let src = sourceIP.trimmingCharacters(in: .whitespaces)
-        for node in nodes { node.connect(sourceIP: src.isEmpty ? nil : src) }
+        let s = src.isEmpty ? nil : src
+        // Cameras auto-connect on add, so most are usually already up — Connect
+        // All then reconnects anything down and revives the rest, and reports
+        // what it did so the button isn't a silent no-op.
+        var connecting = 0, revived = 0
+        for node in nodes {
+            if node.connected { node.refresh(); revived += 1 }
+            else { node.connect(sourceIP: s); connecting += 1 }
+        }
+        log("connect all: \(connecting) connecting, \(revived) already up (revived)")
     }
 
     func disconnectAll() {
@@ -298,6 +549,33 @@ final class ArrayController: ObservableObject {
         for node in nodes where node.connected && !node.stream.isStreaming {
             node.startStream()
         }
+    }
+
+    /// Revive dropped RCP sessions and restart timed-out livestreams WITHOUT
+    /// tearing anything down — deliberately NOT gated on manualSessionActive so a
+    /// mid-calibration drop (MJPEG idle-timeout on a long match) recovers in
+    /// place. A 36-camera match must never have to restart from scratch. Touches
+    /// only connectivity: seeds, frozen masks, and the Log3G10 swap are left
+    /// exactly as they were, and only cameras whose stream is actually down are
+    /// touched (healthy streams don't blip).
+    func reconnectStreams() {
+        let src = sourceIP.trimmingCharacters(in: .whitespaces)
+        let s = src.isEmpty ? nil : src
+        var reconnected = 0, restreamed = 0
+        for node in nodes {
+            if !node.connected {
+                // Session fully dropped (camera == nil) — rebuild it. Its seed is
+                // already gone in this case and will need re-placing.
+                node.connect(sourceIP: s)
+                node.startStream()
+                reconnected += 1
+            } else if !node.stream.isStreaming {
+                node.refresh()        // revive the RCP session
+                node.startStream()    // re-enable + reopen the MJPEG stream
+                restreamed += 1
+            }
+        }
+        log("reconnect: \(reconnected) session(s) rebuilt, \(restreamed) livestream(s) restarted, seeds/transform preserved")
     }
 
     /// Capability gate + APERTURE subscription on every connected body — one
@@ -433,7 +711,11 @@ final class ArrayController: ObservableObject {
         manualLastMeasurementAt.removeAll()
         manualSavedTransforms.removeAll()
         manualChangedOutputs.removeAll()
-        for node in nodes { node.manualMatch = ManualMatchInfo() }
+        manualFrozenNodes.removeAll()
+        manualCertified.removeAll()
+        manualEnteredTransformStage = false
+        manualFocusDwellSince = nil
+        for node in nodes { node.manualMatch = ManualMatchInfo(); node.focusedTrim = false }
 
         manualPhase = .preparing
         manualStatus = "Checking streams, sphere locks, and mirrored outputs…"
@@ -458,6 +740,36 @@ final class ArrayController: ObservableObject {
         manualPhase = .restoring
         manualStatus = "Match verified — restoring saved output presets…"
         log("manual match: finish requested")
+    }
+
+    /// End-of-set action: capture the report (stills are grabbed NOW, while the
+    /// array is still in Log3G10 with matched overlays live), then restore the
+    /// saved output presets. One button for the single-operator flow.
+    /// Capture the report then restore — available whenever a match is live
+    /// (trimming OR verified), because the operator should ALWAYS be able to
+    /// record the array state: a deliberately-different exposure on one camera
+    /// never reaches an all-green "complete", but it still needs a report.
+    /// Cancelling the save dialog leaves the session running (no restore).
+    func finishManualMatchReport() {
+        guard manualTask != nil, manualPhase == .trimming || manualPhase == .complete else { return }
+        let ordered = manualParticipants.sorted { manualIDKey($0) < manualIDKey($1) }
+        let model = MatchReport.model(cameras: ordered,
+                                      target: manualTargetIRE ?? 0,
+                                      toleranceStops: manualToleranceStops,
+                                      spreadStops: manualArraySpreadStops)
+        guard let url = MatchReport.promptAndWrite(model) else {
+            log("manual match: report save cancelled — session left running")
+            return
+        }
+        log("manual match: report saved → \(url.lastPathComponent)")
+        soak.recordMatchEvent("manual_match_report", detail: url.path)
+        // Restore now (works from trimming or complete).
+        manualEndWasFailure = false
+        manualEndMessage = (manualPhase == .complete) ? "Manual Assist complete." : "Manual Assist ended by operator."
+        manualEndRequested = true
+        manualPhase = .restoring
+        manualStatus = "Report saved — restoring saved output presets…"
+        log("manual match: finish + report requested")
     }
 
     private func runManualMatchSession() async {
@@ -492,41 +804,58 @@ final class ArrayController: ObservableObject {
         }
         log("manual match: preparing \(parts.count) camera(s); APERTURE commands disabled")
 
-        // Capture every current output before changing any of them. Unknown
-        // state blocks the transaction so we can always make a safe restore.
-        for node in parts {
-            guard !manualEndRequested else { await closeManualMatch(); return }
-            guard let camera = node.camera else {
-                await failManualMatch("Camera actor unavailable for \(node.ip).")
-                return
+        // Log3G10 · LCD / · SDI swap that output's "Look" (SDI_COLOR_SETTING) to
+        // COLOR_SETTING_LOG for the match, then restore the original (3D LUT /
+        // Custom Display) on Finish/Abort. Display (IPP2) leaves everything
+        // untouched. The livestream mirror source is READ-ONLY status, so the
+        // operator picks the output the stream is actually mirroring; we warn if
+        // the two don't match.
+        if manualTransform.isLog3G10 {
+            manualEnteredTransformStage = true
+            // Freeze every participant's mask BEFORE the swap. The flat/desaturated
+            // Log3G10 look breaks appearance-based detection, so a non-seeded lock
+            // coasts then times out (~3 s) and the all-camera baseline gate fails —
+            // exactly the 2026-07-21 revert. Frozen masks hold geometry and keep
+            // measuring hero IRE at the fixed ROI through the appearance change.
+            // Reversed in closeManualMatch(). Operator seeds are already frozen and
+            // are left untouched.
+            for node in parts where node.freezeTransformLock() {
+                manualFrozenNodes.insert(node.id)
             }
-            let reading = await camera.readActiveMonitorTransform()
-            guard !reading.parameterID.isEmpty, reading.presetValue != nil else {
-                await failManualMatch("Cannot capture the mirrored output preset on \(node.ip); no cameras were intentionally left in an unknown restore state.")
-                return
+            if !manualFrozenNodes.isEmpty {
+                log("manual match: froze \(manualFrozenNodes.count) auto-locked mask(s) to hold through the Log3G10 swap")
             }
-            manualSavedTransforms[node.id] = reading
-        }
-
-        manualStatus = "Temporarily setting the mirrored outputs to Log3G10…"
-        for node in parts {
-            guard !manualEndRequested else { await closeManualMatch(); return }
-            guard let camera = node.camera, let saved = manualSavedTransforms[node.id] else {
-                await failManualMatch("Output transaction lost \(node.ip).")
-                return
+            manualStatus = "Setting Log3G10 on each camera's mirrored output…"
+            for node in parts {
+                guard !manualEndRequested else { await closeManualMatch(); return }
+                guard let camera = node.camera else {
+                    await failManualMatch("Camera actor unavailable for \(node.ip).")
+                    return
+                }
+                // Resolve the exact output feeding THIS camera's livestream mirror
+                // (reads LIVESTREAM_MIRROR_SOURCE, picks the advertised
+                // SDI_COLOR_SETTING param, and reads its current Look). This is the
+                // fix for the 2026-07-20 failure: we no longer guess LCD-vs-SDI, so
+                // the swap always lands on the output the analyzer actually sees.
+                let reading = await camera.readActiveMonitorTransform()
+                guard !reading.parameterID.isEmpty, let before = reading.presetValue else {
+                    await failManualMatch("Cannot resolve/read the Look on \(node.ip)'s livestream mirror output; no output left in an unknown state.")
+                    return
+                }
+                manualSavedTransforms[node.id] = reading
+                // Already Log3G10? leave it (and don't mark it changed).
+                guard before != RCP2.log3G10DisplayPresetValue else { continue }
+                manualChangedOutputs.insert(node.id)
+                let ok = await camera.setMonitorDisplayPreset(
+                    parameterID: reading.parameterID, value: RCP2.log3G10DisplayPresetValue,
+                    reason: "manual match Log3G10")
+                guard ok else {
+                    await failManualMatch("Could not set Log3G10 on \(node.ip) (\(reading.parameterID)).")
+                    return
+                }
             }
-            guard saved.presetValue != RCP2.log3G10DisplayPresetValue else { continue }
-            // Mark it before the SET: even an unconfirmed SET gets a restore
-            // attempt because the camera may have applied it without replying.
-            manualChangedOutputs.insert(node.id)
-            let ok = await camera.setMonitorDisplayPreset(
-                parameterID: saved.parameterID,
-                value: RCP2.log3G10DisplayPresetValue,
-                reason: "manual match Log3G10")
-            guard ok else {
-                await failManualMatch("Log3G10 readback failed on \(node.ip).")
-                return
-            }
+        } else {
+            log("manual match: Display (IPP2) — outputs untouched, 18% gray anchored at \(String(format: "%.1f", Self.ipp2GrayAnchorIRE)) IRE")
         }
 
         guard !manualEndRequested else { await closeManualMatch(); return }
@@ -552,13 +881,21 @@ final class ArrayController: ObservableObject {
         case .median:
             target = median(Array(baselines.values)) ?? 0
         case .gray18:
-            target = Log3G10.grayAnchorIRE
+            // 18% gray anchors at 33.3 IRE in Log3G10, 42.3 IRE in IPP2.
+            target = manualTransform.isLog3G10 ? Log3G10.grayAnchorIRE : Self.ipp2GrayAnchorIRE
         case .custom:
             target = manualCustomTargetIRE ?? 0
         }
-        guard target > 0, Log3G10.linearize(target / 100.0) > 0 else {
-            await failManualMatch("Captured target is outside the usable Log3G10 range.")
-            return
+        if manualTransform.isLog3G10 {
+            guard target > 0, Log3G10.linearize(target / 100.0) > 0 else {
+                await failManualMatch("Captured target is outside the usable Log3G10 range.")
+                return
+            }
+        } else {
+            guard target > 0, target < 100 else {
+                await failManualMatch("Captured target is outside the usable 0–100 IRE range.")
+                return
+            }
         }
 
         manualTargetIRE = target
@@ -584,7 +921,7 @@ final class ArrayController: ObservableObject {
 
         while !manualEndRequested {
             updateManualMatch(parts)
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            try? await Task.sleep(nanoseconds: 50_000_000)   // 20 Hz UI/guidance loop
         }
         await closeManualMatch()
     }
@@ -624,6 +961,9 @@ final class ArrayController: ObservableObject {
         guard let target = manualTargetIRE else { return }
         let now = Date()
 
+        // Only the fullscreen-focused camera runs the ~14 Hz frozen fast path.
+        for node in parts { node.focusedTrim = (node.id == fullScreenNodeID) }
+
         for node in parts {
             let measurementFresh: Bool
             if let measuredAt = node.sphere.measuredAt {
@@ -632,11 +972,13 @@ final class ArrayController: ObservableObject {
                    let ire = node.sphere.heroIRE {
                     var values = manualRecentIRE[node.id, default: []]
                     values.append(ire)
-                    // Median-of-3 (was 5): with the fast analysis path this
-                    // halves the human feedback delay while still rejecting
-                    // single-frame outliers. Latency is the enemy of a hand
-                    // on an iris ring.
-                    if values.count > 3 { values.removeFirst(values.count - 3) }
+                    // The camera a hand is actively on (fullscreen focus) uses a
+                    // median-of-2 — near-raw, minimal lag — because its frozen ROI
+                    // has little detection scatter. Every other participant keeps
+                    // median-of-3 to reject single-frame outliers while it holds.
+                    // Latency is the enemy of a hand on an iris ring.
+                    let window = (node.id == fullScreenNodeID) ? 2 : 3
+                    if values.count > window { values.removeFirst(values.count - window) }
                     manualRecentIRE[node.id] = values
                     manualLastMeasurementAt[node.id] = measuredAt
                 }
@@ -698,6 +1040,50 @@ final class ArrayController: ObservableObject {
         }
 
         manualMatchedCount = parts.filter { $0.manualMatch.phase == .matched }.count
+
+        // --- Guided auto-advance (single operator, fullscreen) ---
+        // A camera is "certified" once it holds a match. If a certified camera
+        // later leaves tolerance (phase OPEN/CLOSE/NO SIGNAL — i.e. past the
+        // matched hysteresis), snap focus back to the earliest such camera.
+        // Otherwise, once the focused camera is certified, jump to the next
+        // uncertified, available camera in ID order.
+        if manualGuidedAdvance, manualSessionActive, fullScreenNodeID != nil {
+            var justDrifted: [CameraNode] = []
+            for node in parts {
+                if node.manualMatch.phase == .matched {
+                    manualCertified.insert(node.id)
+                } else if manualCertified.contains(node.id),
+                          node.manualMatch.phase == .open
+                            || node.manualMatch.phase == .close
+                            || node.manualMatch.phase == .unavailable {
+                    manualCertified.remove(node.id)
+                    justDrifted.append(node)
+                }
+            }
+            let ordered = parts.sorted { manualIDKey($0) < manualIDKey($1) }
+
+            // Dwell: track how long the focused camera has held an unbroken match.
+            let focus = parts.first(where: { $0.id == fullScreenNodeID })
+            if focus?.manualMatch.phase == .matched {
+                if manualFocusDwellSince == nil { manualFocusDwellSince = now }
+            } else {
+                manualFocusDwellSince = nil
+            }
+            let dwellMet = manualFocusDwellSince
+                .map { now.timeIntervalSince($0) >= manualAdvanceDwellSeconds } ?? false
+
+            if let drifted = justDrifted.min(by: { manualIDKey($0) < manualIDKey($1) }) {
+                // Snap-back is immediate — a certified camera that slipped needs
+                // attention now, regardless of the forward dwell.
+                focusManual(on: drifted)
+            } else if let focus, manualCertified.contains(focus.id), dwellMet,
+                      let next = ordered.first(where: {
+                          !manualCertified.contains($0.id) && $0.manualMatch.phase != .unavailable
+                      }) {
+                focusManual(on: next)
+            }
+        }
+
         let liveIRE = parts.compactMap { $0.manualMatch.currentIRE }.sorted()
         if let lo = liveIRE.first, let hi = liveIRE.last, liveIRE.count >= 2 {
             let spread = abs(Log3G10.stops(between: lo, and: hi))
@@ -787,7 +1173,9 @@ final class ArrayController: ObservableObject {
                 failed.append(node.ip)
                 continue
             }
-            if await camera.restoreMonitorTransform(saved) {
+            // Restore the exact Look param we swapped (LCD or SDI) to its
+            // saved value — Custom Display / 3D LUT / etc.
+            if await camera.restoreColorSetting(saved) {
                 restored += 1
             } else {
                 failed.append(node.ip)
@@ -795,9 +1183,18 @@ final class ArrayController: ObservableObject {
         }
 
         let changed = manualChangedOutputs.count
-        let restoreText = changed == 0
-            ? "Outputs were already Log3G10."
-            : "Restored \(restored)/\(changed) changed output preset(s)."
+        let restoreText: String
+        if changed > 0 {
+            restoreText = "Restored \(restored)/\(changed) changed output preset(s)."
+        } else if manualEnteredTransformStage {
+            // Reached the swap stage but every mirrored output was already at
+            // Log3G10, so nothing needed changing.
+            restoreText = "Outputs were already Log3G10."
+        } else {
+            // Blocked in preflight — no output was ever touched. Say nothing about
+            // Log3G10 so it can't read as "outputs are stuck in Log3G10".
+            restoreText = "No output presets were changed."
+        }
         let failureText = failed.isEmpty ? "" : " Restore requires attention: \(failed.joined(separator: ", "))."
         manualStatus = "\(manualEndMessage) \(restoreText)\(failureText)"
         manualPhase = (manualEndWasFailure || !failed.isEmpty) ? .failed : .finished
@@ -806,8 +1203,18 @@ final class ArrayController: ObservableObject {
                               finalSpreadStops: manualArraySpreadStops,
                               detail: manualStatus)
 
+        // Release the masks we froze for the swap so normal tracking resumes.
+        for node in nodes where manualFrozenNodes.contains(node.id) {
+            node.unfreezeTransformLock()
+        }
+        for node in nodes { node.focusedTrim = false }
+
         manualSavedTransforms.removeAll()
         manualChangedOutputs.removeAll()
+        manualFrozenNodes.removeAll()
+        manualCertified.removeAll()
+        manualEnteredTransformStage = false
+        manualFocusDwellSince = nil
         manualEndRequested = false
         manualEndWasFailure = false
         manualTask = nil

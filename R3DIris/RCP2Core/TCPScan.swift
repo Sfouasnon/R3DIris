@@ -52,6 +52,28 @@ enum Subnet {
     static func ipString(_ v: UInt32) -> String {
         "\((v >> 24) & 255).\((v >> 16) & 255).\((v >> 8) & 255).\(v & 255)"
     }
+
+    /// True when `raw` is a subnet MASK (e.g. 255.255.255.0) rather than a
+    /// network address. Without this guard `hosts(from:)` takes a mask as a
+    /// bare address, assumes /24, and sweeps a dead 255.255.255.x range —
+    /// which also, because the subnet field is then non-empty, silently
+    /// disables the zero-config auto-detect that would have found the real
+    /// subnet (array-log finding 2026-07-20: swept "255.255.255.0", 0 found).
+    ///
+    /// Detection: a bare (non-CIDR) dotted quad whose first octet is 255 —
+    /// 255/8 is reserved, never a routable host network — and whose bits are a
+    /// contiguous run of ones then zeros, the definition of a netmask. Catches
+    /// 255.0.0.0, 255.255.0.0, 255.255.255.0, 255.255.255.255.
+    static func looksLikeMask(_ raw: String) -> Bool {
+        let text = raw.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty, !text.contains("/") else { return false }
+        let octets = text.split(separator: ".", omittingEmptySubsequences: false)
+            .map { UInt32($0) ?? UInt32.max }
+        guard octets.count == 4, octets.allSatisfy({ $0 <= 255 }), octets[0] == 255 else { return false }
+        let value = octets.reduce(UInt32(0)) { ($0 << 8) | $1 }
+        let host = ~value
+        return host & (host &+ 1) == 0   // contiguous high ones == valid netmask
+    }
 }
 
 enum TCPScan {

@@ -39,6 +39,23 @@ struct CameraStatus: Sendable, Equatable {
     var name: String = ""
     var serial: String = ""
     var firmware: String = ""
+    var clipName: String = ""   // CLIP_NAME (subscribed push) — source of the ID
+
+    /// Two-letter array identifier derived from CLIP_NAME ("G999_A012" → "GA"):
+    /// reel/group letter + camera letter, matching RCP's display and V3. Empty
+    /// until a clip name in the expected <group><n>_<cam><n> shape is pushed
+    /// (roll once, or the camera already has a current clip).
+    var rcpIdentifier: String {
+        let parts = clipName.split(separator: "_")
+        guard parts.count >= 2,
+              let group = parts[0].first, group.isLetter,
+              let cam = parts[1].first, cam.isLetter else { return "" }
+        return "\(group)\(cam)".uppercased()
+    }
+
+    /// Best human label: the CLIP_NAME-derived identifier, else the CAMERA_INFO
+    /// name (the caller falls back to IP when both are empty).
+    var displayID: String { !rcpIdentifier.isEmpty ? rcpIdentifier : name }
 
     // Liveness
     var currentTC: String = ""

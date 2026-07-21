@@ -85,7 +85,8 @@ ADVERTISED = [
     "APERTURE_LIST_MODE", "AE_MODE", "AE_LOCK_APERTURE",
     "LIVESTREAM_ENABLE", "LIVESTREAM_QUALITY",
     "LIVESTREAM_MIRROR_SOURCE", "LIVESTREAM_RECT_PIXELS",
-    "DISPLAY_PRESET_SDI_1",
+    "DISPLAY_PRESET_SDI_1", "SDI_COLOR_SETTING_BUILT_IN_LCD",
+    "SDI_COLOR_SETTING_SDI_1", "CLIP_NAME_2", "CLIP_NAME",
 ]
 
 JPEG_QUALITY = {1: 40, 2: 60, 3: 80, 4: 95}   # LIVESTREAM_QUALITY 1..4
@@ -191,6 +192,9 @@ class SimCamera:
         self.ip = ip
         self.name = f"SIM-{index + 1:02d}"
         self.serial = f"SIM{index + 1:05d}"
+        # CLIP_NAME drives the array identifier: "G001_A001" → "GA", "G001_B001"
+        # → "GB", … (reel/group letter + camera letter), matching real RCP2.
+        self.clip_name = f"G001_{chr(ord('A') + (index % 26))}001"
         rng = random.Random(seed)
         self.scene = Scene(args.width, args.width * 9 // 16,
                            random.Random(seed + 1))
@@ -213,7 +217,9 @@ class SimCamera:
         self.drift_px_per_min = args.drift
         self.flicker_stops_pp = args.flicker
         self.transform = args.transform
-        self.display_preset = 0 if args.transform == "log3g10" else 6
+        self.display_preset = 0 if args.transform == "log3g10" else 6  # DISPLAY_LUT tone (unused by app)
+        self.color_setting = 0 if args.transform == "log3g10" else 1   # COLOR_SETTING: 0=LOG3G10, 1=3D LUT
+        self.mirror_source = 3  # TOP LCD (read-only status on real bodies)
         self.start_time = time.time()
         self.clients = set()          # websocket connections
         self.log = print if args.verbose else (lambda *a, **k: None)
@@ -259,6 +265,8 @@ class SimCamera:
         if pid == "LIVESTREAM_RECT_PIXELS":
             return {"type": "rcp_cur_str", "id": pid,
                     "cur": {"str": f"0,0,{self.scene.w},{self.scene.h}"}}
+        if pid in ("CLIP_NAME", "CLIP_NAME_2"):
+            return {"type": "rcp_cur_str", "id": pid, "cur": {"str": self.clip_name}}
         ints = {
             "RECORD_STATE": self.record_state,
             "APERTURE_CONTROL": 1,          # every sim body is e-iris
@@ -267,8 +275,10 @@ class SimCamera:
             "AE_LOCK_APERTURE": 0,
             "LIVESTREAM_ENABLE": self.livestream_enabled,
             "LIVESTREAM_QUALITY": self.livestream_quality,
-            "LIVESTREAM_MIRROR_SOURCE": 1,  # SDI-1
+            "LIVESTREAM_MIRROR_SOURCE": self.mirror_source,
             "DISPLAY_PRESET_SDI_1": self.display_preset,
+            "SDI_COLOR_SETTING_BUILT_IN_LCD": self.color_setting,
+            "SDI_COLOR_SETTING_SDI_1": self.color_setting,
         }
         if pid in ints:
             return {"type": "rcp_cur_int", "id": pid, "cur": {"val": ints[pid]}}
@@ -334,6 +344,11 @@ class SimCamera:
             if reply is not None:
                 await ws.send(json.dumps(reply))
             return
+        if mtype == "rcp_get_list" and pid == "LIVESTREAM_QUALITY":
+            await ws.send(json.dumps({
+                "type": "rcp_cur_list", "id": "LIVESTREAM_QUALITY",
+                "list": [{"val": v} for v in (1, 2, 3, 4)]}))
+            return
         if mtype == "rcp_get_list" and pid == "APERTURE":
             await ws.send(json.dumps({
                 "type": "rcp_cur_list", "id": "APERTURE",
@@ -369,7 +384,11 @@ class SimCamera:
             await self.push(pid)
         elif pid == "DISPLAY_PRESET_SDI_1":
             self.display_preset = max(0, min(v, 7))
-            self.transform = "log3g10" if self.display_preset == 0 else "display"
+            await self.push(pid)
+        elif pid in ("SDI_COLOR_SETTING_BUILT_IN_LCD", "SDI_COLOR_SETTING_SDI_1"):
+            # The "Look": 0 = LOG (RWG/Log3G10), 1 = 3D LUT, 2 = Custom Display.
+            self.color_setting = max(0, min(v, 2))
+            self.transform = "log3g10" if self.color_setting == 0 else "display"
             await self.push(pid)
 
     # -- background: iris motor + timecode ------------------------------------

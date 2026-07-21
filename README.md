@@ -1,6 +1,6 @@
 # R3DIris — Phase 0 bench spike + Phase 2 Iris Match + Sphere Soak
 
-Native SwiftUI macOS app (same stack and transport discipline as REDConductorV3).
+Native SwiftUI macOS app.
 Two tabs:
 
 - **Bench** (Phase 0): answers the single-body go/no-go gate —
