@@ -14,6 +14,10 @@ under a new version heading when you tag.
 
 ## [Unreleased]
 
+### Changed
+- Rewrote `README.md` as a product-facing overview (removed internal
+  phase/bench-spike framing and predecessor-project references).
+
 ## [1.0.0] — 2026-07-21
 
 First working end-to-end version. A 12-camera KOMODO-X array was discovered,

@@ -1,130 +1,104 @@
-# R3DIris — Phase 0 bench spike + Phase 2 Iris Match + Sphere Soak
+# R3DIris
 
-Native SwiftUI macOS app.
-Two tabs:
+**Match exposure across a multi-camera RED array to a single gray-sphere target — live, on set.**
 
-- **Bench** (Phase 0): answers the single-body go/no-go gate —
-  can we pull live pixels over IP **and** dial the electronic iris over RCP2?
-- **Array** (Phase 2, added 2026-07-17): the **Iris Match** — bulk T-stop push
-  to every e-iris body plus the closed sphere-targeted exposure-match loop.
-  Sphere auto-detection is R3DMatch v5's calibrated
-  pipeline ported to Swift for live MJPEG frames. The Array tab also includes
-  a distinct Manual Assist workflow for hand-dialed lenses, a write-through
-  Sphere Soak recorder, and Log3G10 viewing-transform preflight.
+R3DIris is a native macOS app for exposure-matching arrays of RED cameras (for
+example a KOMODO-X volume) over the network. Point every camera at the same gray
+sphere and R3DIris reads each camera's live image in the Log3G10 viewing
+transform, tracks the sphere, and guides you to a common target (18% gray =
+33.3 IRE) — then produces a report of the matched array.
 
-**Status: builds with Xcode 16.4** (ad-hoc, unsigned Debug build verified). Nothing here is
-hardware-verified: every aperture, livestream, and transform parameter is
-`# UNVERIFIED` until the bench procedures pass on a body. Phase 0 gates the Array
-tab: do not point the match loop at an array before they pass.
-Bench day run-sheet (consolidated, manual-lens-aware): `BENCH_DAY_PLAN.md`.
+It talks to cameras over RED's RCP2 control protocol and their built-in
+livestream, so no capture or SDI hardware is required — just a network
+connection.
 
-## Build / run
+## What it does
 
-1. Open `R3DIris.xcodeproj` in Xcode 16+ (macOS 14+ target, ad-hoc signing).
-2. Build & run. Approve the **Local Network** permission prompt — without it
-   everything fails silently.
-3. Enter the camera IP (WS control on :9998, livestream on :9090). For
-   link-local camera networks set the source IP of the correct NIC.
+- **Array exposure matching** — discovers every camera on the network, tracks a
+  gray sphere in each live feed, and shows how far each camera is from the shared
+  IRE target.
+- **Manual Assist for hand-dialed lenses** — live OPEN / CLOSE / HOLD guidance
+  overlaid on each camera as you turn the iris ring; it never sends a lens
+  command. A guided single-operator mode advances you camera-by-camera in
+  fullscreen, waits for each to settle, and snaps back if a matched camera drifts.
+- **Log3G10 viewing transform** — temporarily switches each camera's monitored
+  output to RED Wide Gamut / Log3G10 so every camera is measured in the same
+  space, and restores your original look when you finish.
+- **Automatic sphere detection** — a calibrated detector locks onto the gray
+  sphere on its own; one click accepts a mask, or click to place one by hand.
+- **Match report** — a one-page PDF contact sheet: every camera's still with its
+  sphere, IRE, delta from target, and match status, plus the array spread.
+- **Soak recorder** — logs per-frame detection health to CSV with a summary
+  (lock uptime, jitter, gate statistics) for confirming stability over time.
+- **Resilient streaming** — automatically recovers dropped or stalled livestreams
+  mid-session without losing your seeds or your match.
 
-## Layout
+## Requirements
 
-```
-R3DIris/
-  R3DIrisApp.swift            @main
-  Models.swift                CameraStatus + log line
-  BenchController.swift       @MainActor UI bridge; owns the bench log
-  RCP2Core/                   transport, discovery, state, and camera commands
-    RCP2.swift                constants + defensive parsers (+ aperture helpers)
-    RCP2Session.swift         NWConnection WS — ported unchanged from V3
-    CameraActor.swift         V3's proven lifecycle + Phase 0 bench surface
-    TCPScan.swift             subnet TCP sweep on :9998 — ported unchanged from V3
-    UDPDiscovery.swift        CAMINFO broadcast (UDP :1112) — ported unchanged from V3
-  Livestream/
-    MJPEGStreamReader.swift   :9090 multipart-JPEG reader (SOI/EOI scan)
-  Analysis/                   sphere detection + tracking + waveform + Log3G10
-  Array/                      CameraNode + ArrayController + SoakRecorder
-  UI/ContentView.swift        tabs; Bench tab: live view + bench panels + log
-  UI/Theme.swift              V3/V2.1 visual language (Array tab styling)
-  UI/ArrayView.swift          Array tab: discovery + tiles + match panels + waveform
-```
+- macOS 14 (Sonoma) or later
+- Xcode 16 or later to build
+- RED cameras reachable on the local network — RCP2 control on TCP `:9998`,
+  livestream on `:9090`. Validated on KOMODO-X (firmware 2.2.4).
 
-Array-tab camera discovery is V3's method, ported unchanged: PRIMARY is a TCP
-connect-sweep of the configured subnet on :9998 (no WS upgrade → zero session
-slots), FALLBACK is the RCP-native CAMINFO broadcast on UDP :1112. Manual IP
-entry remains as the fallback path for cameras discovery can't see.
+## Getting started
 
-## Test harness (no hardware)
+1. Open `R3DIris.xcodeproj` in Xcode and Run (ad-hoc signing is fine).
+2. Approve the **Local Network** permission on first launch — discovery and
+   streaming won't work without it.
+3. On the **Array** tab, cameras on your subnet are discovered automatically, or
+   enter an IP manually. On a link-local camera network, set the source IP of the
+   correct network interface.
+4. Start the livestreams, place or accept a sphere mask on each camera, then run
+   **Manual Assist** to match every camera to the target and save the report.
 
-`tools/simarray/` simulates 12–40 bodies on loopback IPs — RCP2 WS + MJPEG
-gray-sphere stream + CAMINFO responder per IP, with seeded per-camera T-stop
-calibration errors so the Exposure Match loop has real mismatch to solve. Use
-`--transform log3g10`, `--drift PX_PER_MIN`, and `--flicker STOPS_PP` to exercise
-the new QA paths. Install `tools/simarray/requirements.txt`, set up loopback
-aliases with `tools/simarray/setup_loopback.sh`, then run `sim_array.py`. The
-harness exercises the happy path;
-the Phase 0 bench checklists remain the gate for real bodies.
+The **Bench** tab is a single-camera view for setup and diagnostics — confirm a
+camera streams and responds before adding it to a match.
 
-## Identity
+## How it works
 
-R3DIris has its own look (UI/Theme.swift): graphite neutrals with the iris
-teal→violet duotone, `IrisMark` logo in the chrome, and a matching app icon
-in `Assets.xcassets` (regenerate with `tools/icon/make_icon.py` if the mark
-changes). Deliberately NOT REDConductorV3's palette: siblings, not clones.
-
-`RCP2Core/` is adapted from REDConductorV3's proven transport. Camera-control
-divergences are additive, operator-triggered, and marked `# UNVERIFIED` until
-bench evidence supports them.
+Each camera runs on its own control connection (RCP2 over a WebSocket on `:9998`)
+with the livestream as a separate HTTP/MJPEG feed on `:9090`. R3DIris measures a
+fixed region of the gray sphere in every feed, expressed in Log3G10 IRE, and
+reports each camera's offset from the shared target. Matching is operator-driven:
+R3DIris measures and guides, you turn the ring — it never moves a lens or alters
+a recorded image.
 
 ## Safety model
 
-- One actor and one RCP2 WebSocket per camera body; MJPEG remains a separate
-  HTTP connection on port 9090.
-- Camera sessions close gracefully, reconnect with bounded backoff, and park
-  after repeated failures.
-- Unverified image-side parameters are touched only by deliberate operator
-  actions and logged one camera at a time.
-- Exposure Match requires connected e-iris bodies, live streams, sphere locks,
-  and a homogeneous confirmed viewing transform. Mixed transforms are blocked.
+- One control connection and one livestream per camera; sessions close gracefully
+  and reconnect with bounded backoff.
+- Only the **monitored output** viewing transform is changed, one camera at a
+  time, and it is always restored on Finish or Abort — recorded images and
+  record-side color are never touched.
+- Restoration refuses to overwrite an output that was changed mid-session.
+- Matching requires live streams and a confirmed, consistent viewing transform
+  across the array; mixed states are blocked.
 
-## Bench procedure (the point of Phase 0)
+## Development
 
-Livestream half: **Enable + View** sets
-`LIVESTREAM_ENABLE 1` over the WS then GETs `http://<cam>:9090/`. The log
-records the HTTP headers and the first part's preamble (the actual boundary
-format), then the stats bar gives resolution / fps / bitrate. Latency: wave at
-the lens, compare against the log timestamps. Confirm TC keeps ticking in the
-header while streaming (WS session health).
+Architecture (SwiftUI, `@MainActor` controllers with a per-camera actor for
+transport):
 
-Aperture half: use the numbered buttons in order while watching
-the TC tick after each — a timeout on an unverified param can mean a **wedged
-session** (TCP up, pushes stopped; only reconnect clears it — rule 11). Values
-are stop ×10 (56 = 5.6). Subscribe APERTURE to watch pushed cur/target converge
-— cur == target is the settle detector the Phase 2 loop will use.
+```
+R3DIris/
+  RCP2Core/     camera transport, discovery, and control (RCP2 over WebSocket)
+  Livestream/   MJPEG livestream reader (:9090)
+  Analysis/     gray-sphere detection, tracking, waveform, Log3G10 math
+  Array/        per-camera model, array controller, soak + report
+  UI/           Bench and Array tabs, theme
+```
 
-End-to-end (the actual R3DIris loop): stream running + dial aperture in the
-same session, watch the image brighten/darken live. **Save Log…** — the log is
-the deliverable. Only remove a `# UNVERIFIED` marker after recording repeatable
-behavior on supported bodies and firmware.
+A simulator (`tools/simarray/`) stands up 12–40 virtual cameras on loopback —
+RCP2 + MJPEG gray-sphere stream + discovery per IP, with seeded per-camera
+exposure errors — so the full workflow can be exercised without hardware. See
+`tools/simarray/` for setup.
 
-## Phase 2 QA additions
+## Status
 
-The Array tab separates **Electronic** and **Manual Assist** workflows. Manual
-Assist never sends aperture commands: it captures a fixed median, uses the 18%
-gray Log3G10 anchor at 33.3 IRE, or accepts a custom IRE target. It temporarily
-normalizes each mirrored output to Log3G10, then overlays live OPEN / CLOSE /
-HOLD guidance on every camera feed. A camera must hold the
-target tolerance before it is marked matched, and the whole array must verify
-simultaneously. Finish and Abort both restore the display presets captured at
-session start; restoration refuses to overwrite a mirror source or preset that
-an operator changed during the session.
+**Version 1.0.0 — first working release.** The exposure-matching workflow
+(discovery, livestream, Log3G10 viewing transform, sphere detection, and Manual
+Assist) is verified on KOMODO-X hardware. The electronic e-iris path (driving an
+iris directly over RCP2) is experimental and not yet hardware-verified; it is
+kept out of automatic use and gated behind deliberate operator actions.
 
-The Array tab's **Soak** card opens a CSV destination and records one row per
-analysis tick, plus structured Exposure Match events. On Stop it writes a
-`*_summary.txt` beside the CSV with detection rate, lock/recovery timing,
-center/radius jitter, IRE stability, gate failures, and match readiness.
-
-The **Set Log3G10 on Array** action changes only the active monitor output
-preset feeding the livestream mirror, one body at a time, and reads it back.
-Prepare and Start Match preflight every participant; mixed confirmed viewing
-transforms are blocked. These output parameters remain `# UNVERIFIED` until
-their on-body bench procedure passes.
+See `CHANGELOG.md` for version history.
