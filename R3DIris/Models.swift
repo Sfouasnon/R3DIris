@@ -10,8 +10,7 @@ enum LinkState: String, Sendable {
 }
 
 /// Viewing transform on the monitor output mirrored into the :9090 stream.
-/// Every value remains # UNVERIFIED until RCP2_TRANSFORM_NOTES.md's bench
-/// checklist passes on a real body.
+/// Bench-verified on a real body (RCP2_TRANSFORM_NOTES.md).
 enum MonitorTransformState: String, Sendable, Equatable {
     case log3G10 = "LOG3G10"
     case ipp2 = "IPP2"
@@ -79,7 +78,7 @@ struct CameraStatus: Sendable, Equatable {
     var rectPixels: String = ""         // raw sensor→stream mapping payload, verbatim
 
     // Monitor-output preset feeding the livestream mirror
-    // (RCP2_TRANSFORM_NOTES.md; all # UNVERIFIED on hardware).
+    // (RCP2_TRANSFORM_NOTES.md; bench-verified on hardware).
     var monitorTransformParam: String = ""
     var monitorTransformValue: Int? = nil
     var monitorTransformSeenAt: Date? = nil

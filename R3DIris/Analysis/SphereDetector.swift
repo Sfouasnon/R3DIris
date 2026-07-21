@@ -21,7 +21,9 @@
 //     R3DMatch also gates in display space — but treat every number as
 //     provisional until the Phase 2 bench re-validates on real stream frames.
 //
-//  # UNVERIFIED on live stream frames until benched (IRIS_MATCH_NOTES.md).
+//  Validated on live stream frames across the 2026-07-21 bench soaks
+//  (IRIS_MATCH_NOTES.md); ported thresholds refined there (e.g. the ire_spread
+//  probe geometry) and may still be tuned as more scenes are exercised.
 
 import Foundation
 

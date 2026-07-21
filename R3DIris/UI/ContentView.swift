@@ -62,13 +62,6 @@ struct TopBar: View {
             .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
 
             Spacer()
-
-            Text("# UNVERIFIED — bench Phase 0 first")
-                .font(Theme.mono(9.5, weight: .semibold))
-                .foregroundStyle(Theme.warn)
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(Capsule().fill(Theme.warnBG))
-                .help("No aperture/livestream param has passed the bench checklists yet. The Bench tab's Phase 0 gate comes before pointing the Array tab at real bodies.")
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(Theme.bg1.opacity(0.8))
@@ -263,7 +256,7 @@ struct LivestreamPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             GroupHeader(title: "Livestream — Bench", count: stream.isStreaming ? "live" : "")
-            Text("Multipart-HTTP JPEG on :9090 — separate from the RCP2 WS. # UNVERIFIED until benched.")
+            Text("Multipart-HTTP JPEG on :9090 — separate from the RCP2 WS.")
                 .font(.system(size: 10.5))
                 .foregroundStyle(Theme.ink3)
                 .fixedSize(horizontal: false, vertical: true)

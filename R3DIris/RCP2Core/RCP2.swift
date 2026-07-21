@@ -39,7 +39,7 @@ enum RCP2 {
     static let aeModeParam = "AE_MODE"                    // != OFF and !AE_LOCK_APERTURE → AE owns the iris
     static let aeLockApertureParam = "AE_LOCK_APERTURE"
 
-    // Livestream params (RCP2_LIVESTREAM_NOTES.md). ALL # UNVERIFIED on a body.
+    // Livestream params (RCP2_LIVESTREAM_NOTES.md). Bench-verified on a body.
     static let livestreamEnableParam = "LIVESTREAM_ENABLE"          // 0/1, settable
     static let livestreamQualityParam = "LIVESTREAM_QUALITY"        // 1=Q25 2=Q50 3=Q75 4=Q100
     static let cameraIDParam = "CAMERA_ID"                          // param 42 — user identifier "GA" (rcp_cur_str/int)
@@ -47,9 +47,9 @@ enum RCP2 {
     static let livestreamRectPixelsParam = "LIVESTREAM_RECT_PIXELS"     // status: sensor→stream mapping
 
     // Monitor-output viewing-transform params (RCP2_TRANSFORM_NOTES.md).
-    // ALL # UNVERIFIED on a body and therefore touched only by deliberate
-    // operator actions (rule 11). These are output-side display presets, not
-    // record-side COLOR_SPACE / GAMMA_SPACE image-pipeline controls.
+    // Bench-verified; still touched only by deliberate operator actions
+    // (rule 11). These are output-side display presets, not record-side
+    // COLOR_SPACE / GAMMA_SPACE image-pipeline controls.
     static let displayPresetSDI1Param = "DISPLAY_PRESET_SDI_1"
     static let displayPresetSDI2Param = "DISPLAY_PRESET_SDI_2"
     static let displayPresetBuiltInLCDParam = "DISPLAY_PRESET_BUILT_IN_LCD"

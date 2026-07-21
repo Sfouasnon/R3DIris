@@ -9,10 +9,10 @@
 //    rule 8  — init must fail if the endpoint accepts TCP but answers nothing
 //    rule 9  — subscription-first; NO routine polling of any kind
 //    rule 10 — one-off gets are unsubscribed afterwards (implicit-sub residue)
-//    rule 11 — advertised params only; never blind rcp_gets. Aperture/livestream
-//              params are # UNVERIFIED: they may ONLY be touched through the
-//              bench methods below, one deliberate operator action at a time,
-//              on a session the operator is prepared to lose.
+//    rule 11 — advertised params only; never blind rcp_gets. Aperture params
+//              remain # UNVERIFIED (no e-iris body benched): they may ONLY be
+//              touched through the bench methods below, one deliberate operator
+//              action at a time, on a session the operator is prepared to lose.
 //    rule 13 — request/response transactions are serialized
 //    rule 14 — rcp_session/rcp_footer are serial-only; ignore on WS, never echo
 
@@ -270,12 +270,13 @@ actor CameraActor {
 
     // MARK: - Bench surface (Phase 0 — every call is one operator action)
     //
-    // All aperture/livestream params are # UNVERIFIED on a body (rule 11).
-    // benchGet returns the raw reply so the UI logs exactly what came back;
-    // nil = timeout, which after an unverified get may mean a WEDGED session
-    // (TCP up, pushes stopped — watch the TC tick; reconnect clears it).
+    // Aperture params remain # UNVERIFIED on a body (rule 11); livestream and
+    // monitor-transform params are bench-verified. benchGet returns the raw
+    // reply so the UI logs exactly what came back; nil = timeout, which can mean
+    // a WEDGED session (TCP up, pushes stopped — watch the TC tick; reconnect
+    // clears it).
 
-    /// Deliberate one-off get of an UNVERIFIED param. rule 10: every rcp_get
+    /// Deliberate one-off get. rule 10: every rcp_get
     /// implicitly subscribes camera-side — cancel the residue once per session.
     func benchGet(_ pid: String, timeout: TimeInterval = 2.0) async -> [String: Any]? {
         let pid = RCP2.normParamID(pid)
@@ -283,7 +284,7 @@ actor CameraActor {
             log("bench get \(pid): REFUSED — camera advertises a param list and \(pid) is not in it (rule 11)")
             return nil
         }
-        log("bench get \(pid) → (unverified param — watch for wedge: TC must keep ticking)")
+        log("bench get \(pid)")
         let resp = await sendAndWait(["type": "rcp_get", "id": pid],
                                      replyKeys: ["param:\(pid)"], timeout: timeout)
         if !RCP2.subscribedParams.contains(pid) && !unsubscribed.contains(pid)
@@ -412,7 +413,7 @@ actor CameraActor {
         return confirmed
     }
 
-    // MARK: Monitor viewing transform (rule 11; # UNVERIFIED)
+    // MARK: Monitor viewing transform (rule 11)
 
     /// Read the monitor-output preset that feeds the active livestream mirror.
     /// This is intentionally operator-triggered (Prepare / Start Match), never
@@ -500,7 +501,7 @@ actor CameraActor {
             return false
         }
         let label = RCP2.displayPresetLabels[value] ?? "PRESET \(value)"
-        log("rcp_set \(pid) \(value) (\(label); output-side, # UNVERIFIED)")
+        log("rcp_set \(pid) \(value) (\(label); output-side)")
         do {
             try await session.send([
                 "type": "rcp_set", "id": pid,

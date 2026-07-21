@@ -608,7 +608,7 @@ final class ArrayController: ObservableObject {
                 log("set Log3G10: no connected cameras")
                 return
             }
-            log("set Log3G10: starting on \(targets.count) camera(s) — output-side params # UNVERIFIED")
+            log("set Log3G10: starting on \(targets.count) camera(s) — output-side")
             var confirmed = 0
             for node in targets {
                 guard let camera = node.camera else { continue }

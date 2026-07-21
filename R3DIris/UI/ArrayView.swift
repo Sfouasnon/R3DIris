@@ -438,7 +438,7 @@ struct CameraTile: View {
             ? "active output unknown"
             : node.status.monitorTransformParam
         let value = node.status.monitorTransformValue.map(String.init) ?? "no value"
-        return "Livestream viewing transform: \(pid) = \(value). # UNVERIFIED until the transform bench checklist passes."
+        return "Livestream viewing transform: \(pid) = \(value)."
     }
 
     @ViewBuilder
@@ -1690,7 +1690,7 @@ struct IrisMatchPanel: View {
                 Button("Set Log3G10 on Array") { array.setLog3G10OnArray() }
                     .buttonStyle(DarkButtonStyle())
                     .disabled(array.loopRunning || array.nodes.allSatisfy { !$0.connected })
-                    .help("One deliberate rule-11 action per connected body: capture the current preset for restore, then set only the monitor output feeding the livestream mirror to Log3G10 and read it back. Record-side image settings are untouched. # UNVERIFIED until benched.")
+                    .help("One deliberate rule-11 action per connected body: capture the current preset for restore, then set only the monitor output feeding the livestream mirror to Log3G10 and read it back. Record-side image settings are untouched.")
                 Button("Restore Presets\(array.savedPresetCount > 0 ? " (\(array.savedPresetCount))" : "")") {
                     array.restorePresetsOnArray()
                 }
