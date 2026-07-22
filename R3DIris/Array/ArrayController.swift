@@ -46,6 +46,21 @@ final class ArrayController: ObservableObject {
         didSet { for n in nodes { n.diagnosticsEnabled = logSphereDiagnostics } }
     }
 
+    // MARK: - Latency options (shown in the match panel for both workflows)
+    /// Decode only the freshest buffered livestream frame, dropping stale ones —
+    /// keeps display latency from creeping and offloads the main thread.
+    @Published var dropStaleFrames = true {
+        didSet { for n in nodes { n.stream.dropToLatestFrame = dropStaleFrames } }
+    }
+    /// Temporarily lower the fullscreen-focused camera's stream quality while
+    /// trimming it — smaller frames, less encode/transmit/decode lag on the one
+    /// camera a hand is on; other cameras keep full quality. Restored on unfocus.
+    @Published var lowerFocusStreamQuality = false
+    /// Q25 — enough of a size cut to matter; the focused camera is frozen and
+    /// measured at a fixed ROI, so the flatter JPEG doesn't affect its reading.
+    private static let focusLowQuality = 1
+    private var focusQualityNodeID: UUID?
+
     // MARK: Discovery (V3's method, ported: TCP subnet sweep on :9998 primary,
     // UDP CAMINFO broadcast fallback — both spend ZERO camera session slots.
     // Manual IP entry remains as the fallback path.)
@@ -199,6 +214,22 @@ final class ArrayController: ObservableObject {
     /// Stable ID-order key for guided advance (GA < GB < …; ip as a fallback).
     private func manualIDKey(_ node: CameraNode) -> String {
         node.status.displayID.isEmpty ? node.ip : node.status.displayID
+    }
+
+    /// Drop the focused camera's stream quality (and restore the previously
+    /// lowered one) when the low-latency-focus option is on. Called each manual
+    /// tick but only sends RCP on an actual change. `restoreOnly` on teardown.
+    private func applyFocusStreamQuality(restoreOnly: Bool = false) {
+        let target: UUID? = (restoreOnly || !lowerFocusStreamQuality) ? nil : fullScreenNodeID
+        guard focusQualityNodeID != target else { return }
+        if let prev = focusQualityNodeID, let n = nodes.first(where: { $0.id == prev }) {
+            n.applyLiveQuality(n.desiredQuality)
+        }
+        if let tid = target, let n = nodes.first(where: { $0.id == tid }) {
+            n.applyLiveQuality(Self.focusLowQuality)
+            log("latency: \(manualIDKey(n)) stream → \(RCP2.livestreamQualityLabels[Self.focusLowQuality] ?? "?") while focused")
+        }
+        focusQualityNodeID = target
     }
 
     /// Move fullscreen focus (and selection) to a camera during the guided flow.
@@ -493,6 +524,7 @@ final class ArrayController: ObservableObject {
         let node = CameraNode(ip: ip)
         node.onLog = { [weak self] line in self?.log(line) }
         node.diagnosticsEnabled = logSphereDiagnostics
+        node.stream.dropToLatestFrame = dropStaleFrames
         if soak.isRecording { node.attachSoakRecorder(soak) }
         nodes.append(node)
         if selectedNodeID == nil { selectedNodeID = node.id }
@@ -963,6 +995,7 @@ final class ArrayController: ObservableObject {
 
         // Only the fullscreen-focused camera runs the ~14 Hz frozen fast path.
         for node in parts { node.focusedTrim = (node.id == fullScreenNodeID) }
+        applyFocusStreamQuality()
 
         for node in parts {
             let measurementFresh: Bool
@@ -1208,6 +1241,7 @@ final class ArrayController: ObservableObject {
             node.unfreezeTransformLock()
         }
         for node in nodes { node.focusedTrim = false }
+        applyFocusStreamQuality(restoreOnly: true)   // restore any lowered stream
 
         manualSavedTransforms.removeAll()
         manualChangedOutputs.removeAll()

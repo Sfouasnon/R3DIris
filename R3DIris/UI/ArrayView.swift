@@ -1312,6 +1312,21 @@ struct ArrayActionsPanel: View {
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.ink3)
                 .fixedSize(horizontal: false, vertical: true)
+
+            // Latency options (apply to both Electronic and Manual Assist).
+            Toggle(isOn: $array.dropStaleFrames) {
+                Text("Freshest frame — drop stale livestream frames")
+                    .font(Theme.mono(10.5)).foregroundStyle(Theme.ink2)
+            }
+            .toggleStyle(.switch).tint(Theme.accent)
+            .help("Decode only the newest frame when frames back up: lower display latency and less main-thread load. No effect on the IRE measurement.")
+
+            Toggle(isOn: $array.lowerFocusStreamQuality) {
+                Text("Low-latency focus — drop quality on the trimmed camera")
+                    .font(Theme.mono(10.5)).foregroundStyle(Theme.ink2)
+            }
+            .toggleStyle(.switch).tint(Theme.accent)
+            .help("While a camera is fullscreen during a match, temporarily drop its stream to Q25 for lower latency; other cameras keep full quality. Restored on unfocus. (Most effective during Manual Assist trimming.)")
         }
         .panelCard()
     }

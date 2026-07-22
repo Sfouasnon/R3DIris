@@ -33,12 +33,16 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
     /// Called on the main actor for every decoded frame — the analysis hook
     /// (CameraNode throttles; do NOT do heavy work synchronously in here).
     var onFrame: ((CGImage) -> Void)?
+    /// Decode only the newest buffered frame per callback (drop stale ones) to
+    /// keep display latency from creeping. Set by ArrayController.
+    var dropToLatestFrame = true
 
     private var session: URLSession?
     private var task: URLSessionDataTask?
     private var buffer = Data()
     private var headerLogged = false
     private var preambleLogged = false
+    private var firstFrameLogged = false
     private var frameTimes: [Date] = []
     private var byteWindow: [(Date, Int)] = []
 
@@ -57,6 +61,7 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
         buffer.removeAll()
         headerLogged = false
         preambleLogged = false
+        firstFrameLogged = false
         frameTimes.removeAll()
         byteWindow.removeAll()
         stats = Stats()
@@ -102,9 +107,20 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
             onLog?("livestream: part preamble before first JPEG: \(text)")
         }
 
+        // Freshest-frame: when frames have backed up, decode only the newest and
+        // drop the stale ones undecoded — keeps display latency from creeping and
+        // cuts main-thread decode load. Every arrival is still counted for the fps
+        // stat and the stall watchdog. Off ⇒ decode every frame (original behavior).
+        var latest: Data? = nil
         while let jpeg = extractNextJPEG() {
-            decode(jpeg)
+            recordArrival()
+            if dropToLatestFrame {
+                latest = jpeg
+            } else {
+                decode(jpeg)
+            }
         }
+        if let latest { decode(latest) }
         // Safety: a stream that never yields SOI must not grow unbounded.
         if buffer.count > 32 * 1024 * 1024 {
             onLog?("livestream: 32MB buffered without a complete JPEG — resetting buffer")
@@ -134,24 +150,30 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
         return jpeg
     }
 
-    private func decode(_ jpeg: Data) {
-        guard let src = CGImageSourceCreateWithData(jpeg as CFData, nil),
-              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-            onLog?("livestream: JPEG decode failed (\(jpeg.count) bytes)")
-            return
-        }
+    /// Count a received frame — fps and the stall watchdog reflect the true
+    /// stream rate even when freshest-frame drops some before decode.
+    private func recordArrival() {
         let now = Date()
-        frame = img
         stats.frames += 1
-        stats.width = img.width
-        stats.height = img.height
         stats.lastFrameAt = now
         frameTimes.append(now)
         frameTimes.removeAll { now.timeIntervalSince($0) > 3 }
         if frameTimes.count >= 2, let first = frameTimes.first {
             stats.fps = Double(frameTimes.count - 1) / max(now.timeIntervalSince(first), 0.01)
         }
-        if stats.frames == 1 {
+    }
+
+    private func decode(_ jpeg: Data) {
+        guard let src = CGImageSourceCreateWithData(jpeg as CFData, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            onLog?("livestream: JPEG decode failed (\(jpeg.count) bytes)")
+            return
+        }
+        frame = img
+        stats.width = img.width
+        stats.height = img.height
+        if !firstFrameLogged {
+            firstFrameLogged = true
             onLog?("livestream: first frame \(img.width)×\(img.height), \(jpeg.count) bytes")
         }
         onFrame?(img)

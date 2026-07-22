@@ -14,6 +14,12 @@ under a new version heading when you tag.
 
 ## [Unreleased]
 
+### Added
+- Two latency options in the match panel (both workflows): **Freshest frame**
+  (decode only the newest livestream frame when frames back up; on by default)
+  and **Low-latency focus** (temporarily drop the fullscreen-trimmed camera's
+  stream to Q25, restored on unfocus; off by default).
+
 ### Changed
 - Rewrote `README.md` as a product-facing overview (removed internal
   phase/bench-spike framing and predecessor-project references).

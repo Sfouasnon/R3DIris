@@ -444,6 +444,14 @@ final class CameraNode: ObservableObject, Identifiable {
         Task { _ = await cam.setLivestreamQuality(q) }
     }
 
+    /// Apply a livestream quality now WITHOUT changing the remembered baseline —
+    /// used to temporarily drop the focused camera for latency and restore it to
+    /// `desiredQuality` afterward.
+    func applyLiveQuality(_ q: Int) {
+        guard let cam = camera else { return }
+        Task { _ = await cam.setLivestreamQuality(q) }
+    }
+
     private func updateStreamHealth(fingerprint: UInt64) {
         guard stream.isStreaming else {
             frozenSince = nil; lastFingerprint = 0
