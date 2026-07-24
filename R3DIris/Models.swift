@@ -28,6 +28,29 @@ struct MonitorTransformReading: Sendable, Equatable {
     }
 }
 
+/// One quality factor advertised by `rcp_get_list LIVESTREAM_QUALITY`.
+/// RED's current RCP2 parameter definition exposes four wire values even when
+/// a camera's on-body Live Stream menu presents a smaller set of friendly
+/// choices. The integer is the protocol truth used for set and read-back.
+struct LivestreamQualityOption: Identifiable, Sendable, Equatable, Codable {
+    let value: Int
+    let label: String
+
+    var id: Int { value }
+}
+
+/// Result of one exact LIVESTREAM_QUALITY set + actual read-back transaction.
+/// `actual` is deliberately separate from `requested`: camera configuration
+/// may reject or clamp a value, and measurements may only compare participants
+/// whose actual values are identical.
+struct LivestreamQualityVerification: Sendable, Equatable {
+    let requested: Int
+    let actual: Int?
+    let options: [LivestreamQualityOption]
+
+    var requestConfirmed: Bool { actual == requested }
+}
+
 /// Live status for the one benched camera (published by CameraActor, rendered
 /// by UI). Phase 0 is single-body; the array version arrives in Phase 2.
 struct CameraStatus: Sendable, Equatable {
@@ -74,6 +97,7 @@ struct CameraStatus: Sendable, Equatable {
     // Livestream (RCP2_LIVESTREAM_NOTES.md)
     var livestreamEnabled: Int? = nil
     var livestreamQuality: Int? = nil   // 1=Q25 2=Q50 3=Q75 4=Q100
+    var livestreamQualityOptions: [LivestreamQualityOption] = []
     var mirrorSource: Int? = nil        // 0 none / 1 SDI-1 / 2 SDI-2 / 3 top LCD
     var rectPixels: String = ""         // raw sensor→stream mapping payload, verbatim
 

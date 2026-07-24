@@ -699,7 +699,7 @@ struct ManualCameraHUD: View {
                         .foregroundStyle(selected ? Theme.accent : Theme.ink2)
                     Spacer()
                     if let current = info.currentIRE, let target = info.targetIRE {
-                        Text(String(format: "%.1f → %.1f", current, target))
+                        Text(String(format: "%.1f → %.0f", current, target))
                             .font(Theme.mono(9.5, weight: .semibold))
                             .foregroundStyle(Theme.ink)
                     }
@@ -1130,7 +1130,7 @@ struct BigIREReadouts: View {
                     .font(.system(size: 13, weight: .bold))
                     .tracking(2.5)
                     .foregroundStyle(Theme.ink3)
-                Text(info.targetIRE.map { String(format: "%.1f", $0) } ?? "——")
+                Text(info.targetIRE.map { String(format: "%.0f", $0) } ?? "——")
                     .font(Theme.mono(76, weight: .bold))
                     .foregroundStyle(Theme.ink2)
             }
@@ -1298,17 +1298,22 @@ struct ArrayActionsPanel: View {
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.ink3)
                 Picker("Quality", selection: $array.arrayQuality) {
-                    ForEach([1, 2, 3, 4], id: \.self) { q in
-                        Text(RCP2.livestreamQualityLabels[q] ?? "\(q)").tag(q)
+                    ForEach(array.commonLivestreamQualityOptions) { option in
+                        Text(option.label).tag(option.value)
                     }
                 }
                 .labelsHidden()
                 .frame(maxWidth: 120)
+                .disabled(array.qualityControlsLocked || array.qualityVerificationInProgress)
                 Button("Apply") { array.setQualityAll() }
                     .buttonStyle(DarkButtonStyle())
-                    .disabled(array.manualSessionActive || array.nodes.isEmpty)
+                    .disabled(array.qualityControlsLocked || array.qualityVerificationInProgress || array.nodes.isEmpty)
             }
-            Text("Q100 default, verified per body. Streams come up at this quality; drop it only if viewing many feeds strains the network.")
+            Text(array.arrayQualityStatus)
+                .font(.system(size: 10))
+                .foregroundStyle(array.arrayActualQuality == nil ? Theme.warn : Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("RCP2 factors are Q25/Q50/Q75/Q100. The app sends the exact value, reads each camera back, and blocks measurement unless every actual value is identical.")
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.ink3)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1321,12 +1326,10 @@ struct ArrayActionsPanel: View {
             .toggleStyle(.switch).tint(Theme.accent)
             .help("Decode only the newest frame when frames back up: lower display latency and less main-thread load. No effect on the IRE measurement.")
 
-            Toggle(isOn: $array.lowerFocusStreamQuality) {
-                Text("Low-latency focus — drop quality on the trimmed camera")
-                    .font(Theme.mono(10.5)).foregroundStyle(Theme.ink2)
-            }
-            .toggleStyle(.switch).tint(Theme.accent)
-            .help("While a camera is fullscreen during a match, temporarily drop its stream to Q25 for lower latency; other cameras keep full quality. Restored on unfocus. (Most effective during Manual Assist trimming.)")
+            Text("During measurement, every participant is held at one identical camera-reported quality. Fullscreen focus changes analysis cadence only; it never changes JPEG quality.")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .panelCard()
     }
@@ -1479,7 +1482,7 @@ struct ManualAssistPanel: View {
 
             if array.manualTargetIRE != nil {
                 HStack(spacing: 6) {
-                    manualStat("TARGET", array.manualTargetIRE.map { String(format: "%.1f IRE", $0) } ?? "—")
+                    manualStat("TARGET", array.manualTargetIRE.map { String(format: "%.0f IRE", $0) } ?? "—")
                     manualStat("MATCHED", "\(array.manualMatchedCount)/\(array.manualParticipantCount)")
                     manualStat("SPREAD", array.manualArraySpreadStops.map { String(format: "%.2fst", $0) } ?? "—")
                 }
@@ -1620,7 +1623,7 @@ struct ManualTrimFocus: View {
                 Text(String(format: "band ±%.2f ST", info.toleranceStops))
                     .foregroundStyle(Theme.ink3)
                 Spacer()
-                Text(info.targetIRE.map { String(format: "target %.1f", $0) } ?? "target —")
+                Text(info.targetIRE.map { String(format: "target %.0f", $0) } ?? "target —")
             }
             .font(Theme.mono(10.5))
             .foregroundStyle(Theme.ink2)

@@ -14,7 +14,8 @@ enum Log3G10 {
     static let g = 15.1927
 
     /// 18% scene-linear gray's expected Log3G10 code value, expressed as IRE.
-    static var grayAnchorIRE: Double { encode(0.18) * 100.0 }
+    /// Keep the calibrated value intact for matching and round only UI text.
+    static let grayAnchorIRE = 33.333291
 
     /// Scene-linear value to normalized Log3G10 code value.
     static func encode(_ linear: Double) -> Double {

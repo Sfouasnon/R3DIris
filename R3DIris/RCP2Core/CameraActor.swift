@@ -170,6 +170,8 @@ actor CameraActor {
         status.link = running ? .connecting : .disconnected
         status.tcSeenAt = nil
         status.apertureSeenAt = nil
+        status.livestreamQuality = nil
+        status.livestreamQualityOptions = []
         publish()
     }
 
@@ -366,51 +368,91 @@ actor CameraActor {
         }
     }
 
-    /// LIVESTREAM_QUALITY 1–4 → Q25/Q50/Q75/Q100. Measure at Q100 — JPEG
-    /// compression perturbs patch statistics at low Q (LIVESTREAM_NOTES).
-    ///
-    /// Returns true only when the camera READS BACK the value we set.
-    /// LIVESTREAM_QUALITY is not a subscribed param, so the camera never pushes
-    /// it — without this read-back a silently-held Q25 is indistinguishable
-    /// from an accepted Q100, which is exactly how a 40-camera array corrupts a
-    /// match with no signal (soak finding 2026-07-20). The verify read mirrors
-    /// setMonitorDisplayPreset's rule-10 one-off unsubscribe discipline.
-    @discardableResult
-    func setLivestreamQuality(_ q: Int) async -> Bool {
-        guard let session else { return false }
+    /// Ask the body which LIVESTREAM_QUALITY factors are valid in its current
+    /// configuration. The current RCP2 definition is Q25/Q50/Q75/Q100 (1...4),
+    /// but this list is the body's runtime truth and is retained in status for
+    /// the bench manifest and operator UI.
+    func getLivestreamQualityOptions(timeout: TimeInterval = 2.0) async -> [LivestreamQualityOption] {
+        log("rcp_get_list LIVESTREAM_QUALITY")
+        let reply = await sendAndWait(
+            ["type": "rcp_get_list", "id": RCP2.livestreamQualityParam],
+            replyKeys: ["rcp_cur_list:\(RCP2.livestreamQualityParam)",
+                        "param:\(RCP2.livestreamQualityParam)",
+                        "rcp_cur_list"],
+            timeout: timeout)
+        if let reply,
+           let data = try? JSONSerialization.data(withJSONObject: reply, options: [.sortedKeys]),
+           let raw = String(data: data, encoding: .utf8) {
+            log("LIVESTREAM_QUALITY list raw \(raw)")
+        }
+        let options = RCP2.extractLivestreamQualityOptions(reply)
+        status.livestreamQualityOptions = options
+        publish()
+        let description = options.isEmpty
+            ? "no list reply"
+            : options.map { "\($0.label)=\($0.value)" }.joined(separator: ", ")
+        log("LIVESTREAM_QUALITY factors: \(description)")
+        return options
+    }
 
-        // The valid quality factors are context-dependent — LIVESTREAM_QUALITY
-        // supports rcp_get_list, and real bodies clamp Q100 at some stream
-        // configs (bench 2026-07-20: set Q100, camera held Q50/Q25). Ask the
-        // camera which factors it currently allows, and target the best one
-        // ≤ requested, so a silent clamp becomes a reported result.
-        let listReply = await sendAndWait(["type": "rcp_get_list", "id": RCP2.livestreamQualityParam],
-                                          replyKeys: ["rcp_cur_list"], timeout: 2)
-        let allowed = RCP2.extractIntList(listReply)
-        var target = q
-        if !allowed.isEmpty, !allowed.contains(q) {
-            target = allowed.filter { $0 <= q }.max() ?? allowed.min() ?? q
-            log("LIVESTREAM_QUALITY \(RCP2.livestreamQualityLabels[q] ?? "\(q)") not available (camera allows: \(allowed.map { RCP2.livestreamQualityLabels[$0] ?? "\($0)" }.joined(separator: " "))) — using \(RCP2.livestreamQualityLabels[target] ?? "\(target)")")
+    /// Read the quality the camera is actually using. This is intentionally a
+    /// one-off get, not a cached/requested value.
+    func readLivestreamQuality(timeout: TimeInterval = 2.0) async -> Int? {
+        unsubscribed.remove(RCP2.livestreamQualityParam)
+        let reply = await benchGet(RCP2.livestreamQualityParam, timeout: timeout)
+        let actual = RCP2.extractLivestreamQuality(
+            reply,
+            options: status.livestreamQualityOptions
+        )
+        status.livestreamQuality = actual
+        publish()
+        return actual
+    }
+
+    /// Clear a failed validation read so an older stream-rect payload cannot be
+    /// mistaken for end-of-trial provenance.
+    func clearLivestreamRectReadback() {
+        status.rectPixels = ""
+        publish()
+    }
+
+    /// LIVESTREAM_QUALITY 1–4 → Q25/Q50/Q75/Q100. Send the exact protocol
+    /// value the operator selected, then return the independent actual read-back.
+    /// Never substitute a different per-camera factor: the array gate compares
+    /// actual values and must not hide a mixed-quality measurement behind local
+    /// fallback choices.
+    @discardableResult
+    func setLivestreamQuality(_ q: Int) async -> LivestreamQualityVerification {
+        guard let session, (1...4).contains(q) else {
+            return LivestreamQualityVerification(requested: q, actual: nil, options: [])
         }
 
-        log("rcp_set LIVESTREAM_QUALITY \(target) (\(RCP2.livestreamQualityLabels[target] ?? "?"))")
+        let options = await getLivestreamQualityOptions()
+        if !options.isEmpty, !options.contains(where: { $0.value == q }) {
+            log("LIVESTREAM_QUALITY \(RCP2.livestreamQualityLabels[q] ?? "\(q)") is not in the camera's actual list — sending the exact requested value so read-back can prove acceptance or rejection")
+        }
+
+        log("rcp_set LIVESTREAM_QUALITY \(q) (\(RCP2.livestreamQualityLabels[q] ?? "?"))")
         do {
-            try await session.send(["type": "rcp_set", "id": RCP2.livestreamQualityParam, "value": target])
+            try await session.send(["type": "rcp_set", "id": RCP2.livestreamQualityParam, "value": q])
         } catch {
             status.lastError = String(describing: error)
             publish()
-            return false
+            return LivestreamQualityVerification(requested: q, actual: nil, options: options)
         }
 
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        unsubscribed.remove(RCP2.livestreamQualityParam)
-        let verify = await benchGet(RCP2.livestreamQualityParam)
-        let readBack = RCP2.extractInt(verify)
-        if let readBack { status.livestreamQuality = readBack; publish() }
-        let confirmed = (readBack == target)
+        // Firmware may apply the JPEG encoder setting asynchronously. Use a
+        // bounded read-back sequence instead of trusting one arbitrary delay.
+        var readBack: Int?
+        for delayMS in [150, 350, 700] {
+            try? await Task.sleep(nanoseconds: UInt64(delayMS) * 1_000_000)
+            readBack = await readLivestreamQuality()
+            if readBack == q { break }
+        }
+        let confirmed = (readBack == q)
         let seen = readBack.map { RCP2.livestreamQualityLabels[$0] ?? "\($0)" } ?? "no reply"
-        log("LIVESTREAM_QUALITY \(confirmed ? "CONFIRMED at \(RCP2.livestreamQualityLabels[target] ?? "\(target)")" : "NOT CONFIRMED — set \(RCP2.livestreamQualityLabels[target] ?? "\(target)"), camera reports \(seen)")")
-        return confirmed
+        log("LIVESTREAM_QUALITY \(confirmed ? "CONFIRMED at \(RCP2.livestreamQualityLabels[q] ?? "\(q)")" : "NOT CONFIRMED — requested \(RCP2.livestreamQualityLabels[q] ?? "\(q)"), actual read-back \(seen)")")
+        return LivestreamQualityVerification(requested: q, actual: readBack, options: options)
     }
 
     // MARK: Monitor viewing transform (rule 11)
@@ -421,7 +463,18 @@ actor CameraActor {
     /// never touched.
     func readActiveMonitorTransform(timeout: TimeInterval = 2.0) async -> MonitorTransformReading {
         let mirrorReply = await benchGet(RCP2.livestreamMirrorSourceParam, timeout: timeout)
-        let mirror = RCP2.extractInt(mirrorReply) ?? status.mirrorSource
+        // This operation is a measurement preflight: never fall back to a
+        // cached mirror source after a missing reply.
+        let mirrorReadback = RCP2.extractInt(mirrorReply)
+        status.mirrorSource = mirrorReadback
+        guard let mirror = mirrorReadback, (1...3).contains(mirror) else {
+            status.monitorTransformParam = ""
+            status.monitorTransformValue = nil
+            status.monitorTransformSeenAt = nil
+            publish()
+            log("monitor transform: UNKNOWN — no fresh, valid livestream mirror-source read-back")
+            return MonitorTransformReading(mirrorSource: mirrorReadback)
+        }
         let candidates = RCP2.monitorDisplayPresetCandidates(forMirrorSource: mirror)
         let pid = advertised.isEmpty
             ? candidates.first
@@ -431,7 +484,7 @@ actor CameraActor {
             status.monitorTransformValue = nil
             status.monitorTransformSeenAt = nil
             publish()
-            log("monitor transform: UNKNOWN — livestream mirror source \(mirror.map(String.init) ?? "unavailable") has no output preset mapping")
+            log("monitor transform: UNKNOWN — livestream mirror source \(mirror) has no output preset mapping")
             return MonitorTransformReading(mirrorSource: mirror)
         }
 
@@ -450,7 +503,7 @@ actor CameraActor {
             publish()
         }
         let label = value.flatMap { RCP2.displayPresetLabels[$0] } ?? "UNKNOWN"
-        log("monitor transform: mirror \(RCP2.mirrorSourceLabels[mirror ?? -1] ?? "source \(mirror ?? -1)") → \(pid) = \(value.map(String.init) ?? "no reply") (\(label))")
+        log("monitor transform: mirror \(RCP2.mirrorSourceLabels[mirror] ?? "source \(mirror)") → \(pid) = \(value.map(String.init) ?? "no reply") (\(label))")
         return MonitorTransformReading(mirrorSource: mirror,
                                        parameterID: pid,
                                        presetValue: value)
@@ -626,7 +679,14 @@ actor CameraActor {
         case RCP2.livestreamEnableParam:
             if let v = RCP2.extractInt(msg) { status.livestreamEnabled = v }
         case RCP2.livestreamQualityParam:
-            if let v = RCP2.extractInt(msg) { status.livestreamQuality = v }
+            if type == "rcp_cur_list" {
+                status.livestreamQualityOptions = RCP2.extractLivestreamQualityOptions(msg)
+            } else if let v = RCP2.extractLivestreamQuality(
+                msg,
+                options: status.livestreamQualityOptions
+            ) {
+                status.livestreamQuality = v
+            }
         case RCP2.livestreamMirrorSourceParam:
             if let v = RCP2.extractInt(msg) {
                 status.mirrorSource = v
@@ -640,7 +700,10 @@ actor CameraActor {
         case RCP2.livestreamRectPixelsParam:
             // Keep the raw payload verbatim — the sensor→stream rect shape is
             // undocumented; the bench log is where we learn it.
-            if let data = try? JSONSerialization.data(withJSONObject: msg),
+            if let data = try? JSONSerialization.data(
+                withJSONObject: msg,
+                options: [.sortedKeys]
+            ),
                let s = String(data: data, encoding: .utf8) {
                 status.rectPixels = s
             }

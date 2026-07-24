@@ -81,7 +81,7 @@ struct BenchRootView: View {
                 VStack(spacing: 0) {
                     // stream is a nested ObservableObject — pass it explicitly so
                     // its @Published changes actually invalidate these views.
-                    LiveView(stream: bench.stream)
+                    LiveView(stream: bench.stream, validation: bench.validation)
                     Rectangle().fill(Theme.line).frame(height: 1)
                     LogPane()
                         .frame(minHeight: 140, idealHeight: 200)
@@ -90,6 +90,7 @@ struct BenchRootView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         LivestreamPanel(stream: bench.stream)
+                        IREValidationPanel(validation: bench.validation)
                         AperturePanel()
                         Spacer()
                     }
@@ -123,19 +124,24 @@ struct HeaderBar: View {
                 Button("Connect") { bench.connect() }
                     .buttonStyle(DarkButtonStyle(prominent: true))
                     .keyboardShortcut(.defaultAction)
+                    .disabled(bench.validation.isBusy)
                 if bench.status.link == .parked {
                     Button("Refresh") { bench.refresh() }
                         .buttonStyle(DarkButtonStyle())
+                        .disabled(bench.validation.isBusy)
                 }
             case .connecting:
                 Button("Cancel") { bench.disconnect() }
                     .buttonStyle(DarkButtonStyle())
+                    .disabled(bench.validation.isBusy)
                 ProgressView().controlSize(.small)
             case .connected:
                 Button("Disconnect") { bench.disconnect() }
                     .buttonStyle(DarkButtonStyle(destructive: true))
+                    .disabled(bench.validation.isBusy)
                 Button("Refresh") { bench.refresh() }
                     .buttonStyle(DarkButtonStyle())
+                    .disabled(bench.validation.isBusy)
             }
 
             LinkBadge(state: bench.status.link)
@@ -196,20 +202,40 @@ struct LinkBadge: View {
 
 struct LiveView: View {
     @ObservedObject var stream: MJPEGStreamReader
+    @ObservedObject var validation: IREValidationController
 
     var body: some View {
         VStack(spacing: 6) {
-            ZStack {
-                Rectangle().fill(Color.black)
-                if let frame = stream.frame {
-                    Image(decorative: frame, scale: 1.0)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                } else {
-                    Text(stream.isStreaming ? "waiting for first frame…" : "no stream")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Theme.ink3)
+            GeometryReader { proxy in
+                let rect = fittedImageRect(in: proxy.size)
+                ZStack {
+                    Rectangle().fill(Color.black)
+                    if let frame = stream.frame {
+                        Image(decorative: frame, scale: 1.0)
+                            .resizable()
+                            .frame(width: rect.width, height: rect.height)
+                            .position(x: rect.midX, y: rect.midY)
+                        IREValidationOverlay(validation: validation, imageRect: rect)
+                    } else {
+                        Text(stream.isStreaming ? "waiting for first frame…" : "no stream")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.ink3)
+                    }
                 }
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onEnded { gesture in
+                            guard stream.frame != nil, rect.contains(gesture.location),
+                                  rect.width > 0, rect.height > 0 else { return }
+                            validation.addSelectionPoint(
+                                IRENormalizedPoint(
+                                    x: (gesture.location.x - rect.minX) / rect.width,
+                                    y: (gesture.location.y - rect.minY) / rect.height
+                                )
+                            )
+                        }
+                )
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -242,6 +268,27 @@ struct LiveView: View {
                 .foregroundStyle(Theme.ink2)
         }
     }
+
+    private func fittedImageRect(in container: CGSize) -> CGRect {
+        guard let frame = stream.frame, frame.width > 0, frame.height > 0,
+              container.width > 0, container.height > 0 else {
+            return CGRect(origin: .zero, size: container)
+        }
+        let imageAspect = CGFloat(frame.width) / CGFloat(frame.height)
+        let containerAspect = container.width / container.height
+        let size: CGSize
+        if imageAspect > containerAspect {
+            size = CGSize(width: container.width, height: container.width / imageAspect)
+        } else {
+            size = CGSize(width: container.height * imageAspect, height: container.height)
+        }
+        return CGRect(
+            x: (container.width - size.width) / 2,
+            y: (container.height - size.height) / 2,
+            width: size.width,
+            height: size.height
+        )
+    }
 }
 
 // MARK: - Livestream bench panel
@@ -252,6 +299,13 @@ struct LivestreamPanel: View {
     @State private var quality = 4   // measure at Q100 (LIVESTREAM_NOTES)
 
     var connected: Bool { bench.status.link == .connected }
+    private var qualityOptions: [LivestreamQualityOption] {
+        bench.status.livestreamQualityOptions.isEmpty
+            ? (1...4).map {
+                .init(value: $0, label: RCP2.livestreamQualityLabels[$0] ?? "\($0)")
+            }
+            : bench.status.livestreamQualityOptions
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -266,28 +320,34 @@ struct LivestreamPanel: View {
                     bench.enableLivestreamAndView()
                 }
                 .buttonStyle(DarkButtonStyle(prominent: true))
-                .disabled(!connected || stream.isStreaming)
+                .disabled(!connected || stream.isStreaming || bench.validation.isBusy)
                 Button("Stop") { bench.stopLivestream() }
                     .buttonStyle(DarkButtonStyle())
-                    .disabled(!stream.isStreaming)
+                    .disabled(!stream.isStreaming || bench.validation.isBusy)
             }
 
             HStack(spacing: 6) {
                 Picker("Quality", selection: $quality) {
-                    ForEach(1...4, id: \.self) { q in
-                        Text(RCP2.livestreamQualityLabels[q] ?? "\(q)").tag(q)
+                    ForEach(qualityOptions) { option in
+                        Text(option.label).tag(option.value)
                     }
                 }
                 .font(.system(size: 11))
                 .frame(width: 140)
+                .disabled(bench.validation.isBusy)
                 Button("Set") { bench.setQuality(quality) }
                     .buttonStyle(DarkButtonStyle())
-                    .disabled(!connected)
+                    .disabled(!connected || bench.validation.isBusy)
             }
+
+            Text("RCP2 wire factors are Q25/Q50/Q75/Q100. Capture records the camera-advertised list and actual read-back.")
+                .font(.system(size: 9.8))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
 
             Button("Read mirror source + rect") { bench.readMirrorAndRect() }
                 .buttonStyle(DarkButtonStyle())
-                .disabled(!connected)
+                .disabled(!connected || bench.validation.isBusy)
 
             Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
                 GridRow {
@@ -309,6 +369,13 @@ struct LivestreamPanel: View {
             .font(Theme.mono(10.5))
         }
         .panelCard()
+        .onChange(of: bench.status.livestreamQualityOptions) {
+            guard !qualityOptions.contains(where: { $0.value == quality }) else { return }
+            quality = bench.status.livestreamQuality
+                .flatMap { actual in qualityOptions.first(where: { $0.value == actual })?.value }
+                ?? qualityOptions.last?.value
+                ?? quality
+        }
     }
 }
 
@@ -353,7 +420,7 @@ struct AperturePanel: View {
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.ink2)
             }
-            .disabled(!connected)
+            .disabled(!connected || bench.validation.isBusy)
 
             Rectangle().fill(Theme.line).frame(height: 1)
 
@@ -362,18 +429,19 @@ struct AperturePanel: View {
                 TextField("stop", text: $stopText)
                     .darkField()
                     .frame(width: 56)
+                    .disabled(bench.validation.isBusy)
                 Button("4. Set") {
                     if let x10 = stopX10 { bench.setAperture(stopX10: x10) }
                 }
                 .buttonStyle(DarkButtonStyle(prominent: true))
-                .disabled(!connected || stopX10 == nil)
+                .disabled(!connected || stopX10 == nil || bench.validation.isBusy)
                 Spacer()
                 Button("5. Nudge −") { bench.nudgeAperture(-1) }
                     .buttonStyle(DarkButtonStyle())
-                    .disabled(!connected)
+                    .disabled(!connected || bench.validation.isBusy)
                 Button("Nudge +") { bench.nudgeAperture(1) }
                     .buttonStyle(DarkButtonStyle())
-                    .disabled(!connected)
+                    .disabled(!connected || bench.validation.isBusy)
             }
 
             Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {

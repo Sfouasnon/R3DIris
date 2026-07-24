@@ -264,13 +264,158 @@ enum RCP2 {
             if let s = obj as? String { return Int(s.trimmingCharacters(in: .whitespaces)) }
             return nil
         }
-        for key in ["list", "values", "data", "cur"] {
-            if let arr = msg[key] as? [Any] {
-                let ints = arr.compactMap { val($0) }
-                if !ints.isEmpty { return ints }
+
+        // RCP2 bodies have emitted both a direct array and an array nested under
+        // a `cur`/`data` object. Walk only list-shaped keys so unrelated fields
+        // such as min/max/status do not become phantom choices.
+        func list(_ obj: Any?) -> [Int] {
+            if let arr = obj as? [Any] {
+                let direct = arr.compactMap { val($0) }
+                if !direct.isEmpty { return direct }
+                for item in arr {
+                    let nested = list(item)
+                    if !nested.isEmpty { return nested }
+                }
             }
+            if let dict = obj as? [String: Any] {
+                for key in ["list", "values", "entries", "items", "options", "data", "cur"] {
+                    let nested = list(dict[key])
+                    if !nested.isEmpty { return nested }
+                }
+            }
+            return []
         }
-        return []
+        return list(msg)
+    }
+
+    /// Parse the camera-advertised quality factors while preserving any labels
+    /// supplied in `rcp_cur_list`. The documented Q-factor label remains the
+    /// fallback because it is the stable RCP2 wire meaning.
+    static func extractLivestreamQualityOptions(_ msg: [String: Any]?) -> [LivestreamQualityOption] {
+        guard let msg else { return [] }
+
+        func integer(_ obj: Any?) -> Int? {
+            if let i = obj as? Int { return i }
+            if let d = obj as? Double { return Int(d) }
+            if let s = obj as? String { return Int(s.trimmingCharacters(in: .whitespaces)) }
+            if let dict = obj as? [String: Any] {
+                for key in ["val", "value", "num", "id"] {
+                    if let found = integer(dict[key]) { return found }
+                }
+            }
+            return nil
+        }
+
+        func text(_ obj: Any?) -> String? {
+            if let s = obj as? String {
+                let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            if let dict = obj as? [String: Any] {
+                for key in ["label", "display", "name", "abbr", "str"] {
+                    if let found = text(dict[key]) { return found }
+                }
+            }
+            return nil
+        }
+
+        func optionArray(_ obj: Any?) -> [LivestreamQualityOption] {
+            if let arr = obj as? [Any] {
+                var found: [LivestreamQualityOption] = []
+                for item in arr {
+                    if let value = integer(item), (1...4).contains(value) {
+                        let documented = livestreamQualityLabels[value] ?? "\(value)"
+                        let cameraText = text(item)
+                        let label = cameraText.flatMap {
+                            $0.caseInsensitiveCompare(documented) == .orderedSame ? nil : $0
+                        }.map { "\(documented) · \($0)" } ?? documented
+                        found.append(.init(value: value, label: label))
+                    }
+                }
+                if !found.isEmpty { return found }
+                for item in arr {
+                    let nested = optionArray(item)
+                    if !nested.isEmpty { return nested }
+                }
+            }
+            if let dict = obj as? [String: Any] {
+                // Some JSON bridges expose parallel value/display arrays.
+                for valueKey in ["values", "list_values", "nums"] {
+                    guard let values = dict[valueKey] as? [Any] else { continue }
+                    let ints = values.compactMap(integer).filter { (1...4).contains($0) }
+                    guard !ints.isEmpty else { continue }
+                    for labelKey in ["labels", "strings", "displays", "names", "abbrs"] {
+                        guard let labels = dict[labelKey] as? [Any],
+                              labels.count == ints.count else { continue }
+                        return zip(ints, labels).map { value, rawLabel in
+                            let documented = livestreamQualityLabels[value] ?? "\(value)"
+                            guard let cameraText = text(rawLabel),
+                                  cameraText.caseInsensitiveCompare(documented) != .orderedSame else {
+                                return .init(value: value, label: documented)
+                            }
+                            return .init(value: value, label: "\(documented) · \(cameraText)")
+                        }
+                    }
+                }
+                for key in ["list", "values", "entries", "items", "options", "data", "cur"] {
+                    let nested = optionArray(dict[key])
+                    if !nested.isEmpty { return nested }
+                }
+            }
+            return []
+        }
+
+        var seen = Set<Int>()
+        return optionArray(msg)
+            .filter { seen.insert($0.value).inserted }
+            .sorted { $0.value < $1.value }
+    }
+
+    /// Decode an actual LIVESTREAM_QUALITY read-back. RED permits both
+    /// `rcp_cur_int` and `rcp_cur_str`; string replies may carry the SDK enum
+    /// token instead of its integer. Camera-provided public labels are accepted
+    /// only when their value relationship was learned from that body's list.
+    static func extractLivestreamQuality(
+        _ msg: [String: Any]?,
+        options: [LivestreamQualityOption] = []
+    ) -> Int? {
+        if let integer = extractInt(msg), (1...4).contains(integer) { return integer }
+
+        func normalized(_ value: String) -> String {
+            value
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .uppercased()
+                .replacingOccurrences(of: "-", with: "_")
+                .replacingOccurrences(of: " ", with: "_")
+        }
+
+        let raw = extractDisplay(msg)
+        guard !raw.isEmpty else { return nil }
+        let token = normalized(raw)
+        let documented: [String: Int] = [
+            "Q25": 1, "Q_FACTOR_25": 1, "JPEG_QUALITY_Q_FACTOR_25": 1,
+            "Q50": 2, "Q_FACTOR_50": 2, "JPEG_QUALITY_Q_FACTOR_50": 2,
+            "Q75": 3, "Q_FACTOR_75": 3, "JPEG_QUALITY_Q_FACTOR_75": 3,
+            "Q100": 4, "Q_FACTOR_100": 4, "JPEG_QUALITY_Q_FACTOR_100": 4,
+        ]
+        if let value = documented[token] { return value }
+        for (suffix, value) in [
+            ("Q_FACTOR_25", 1), ("Q_FACTOR_50", 2),
+            ("Q_FACTOR_75", 3), ("Q_FACTOR_100", 4),
+        ] where token.hasSuffix(suffix) {
+            return value
+        }
+
+        // A decoded list label may be stored as "Q75 · High". Compare every
+        // component, but never invent a Low/Medium/High mapping without that
+        // camera-supplied relationship.
+        for option in options {
+            let components = option.label.split(separator: "·").map {
+                normalized(String($0))
+            }
+            if components.contains(token) { return option.value }
+        }
+        return nil
     }
 
     /// True for a real HH:MM:SS(:|;FF) timecode — guards against placeholder junk.

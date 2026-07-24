@@ -15,14 +15,50 @@ under a new version heading when you tag.
 ## [Unreleased]
 
 ### Added
-- Two latency options in the match panel (both workflows): **Freshest frame**
-  (decode only the newest livestream frame when frames back up; on by default)
-  and **Low-latency focus** (temporarily drop the fullscreen-trimmed camera's
-  stream to Q25, restored on unfocus; off by default).
+- **Freshest frame** mode in the match panel decodes only the newest livestream
+  frame when frames back up and is enabled by default.
+- **Bench IRE validation** captures 300 untouched port-9090 JPEGs per trial for
+  simultaneous comparison with a 10-bit SDI waveform reading from Nobe
+  OmniScope. It supports gray-card, gray-sphere, and four-corner Macbeth chart
+  ROIs and exports the source JPEGs, measurements, camera state, and manifest.
 
 ### Changed
+- **Manual Assist presents a whole-IRE target without rounding its calibration.**
+  Match math retains the exact captured value (including the Log3G10 18% gray
+  anchor at 33.333291 IRE); operator-facing target labels round to a whole IRE so
+  a hand-set, non-click lens is not expected to land on a flickering decimal.
+- **IRE matching now measures the approved ROI from the native 1920×1080 JPEG**
+  while sphere detection, lock gates, and waveform diagnostics remain at the
+  480-pixel analysis resolution.
+- **Livestream quality is camera-advertised and read-back verified.** Array
+  measurements require the same actual quality across every participant, and
+  the focused-camera quality can no longer change during a measurement.
+- **The view returns to multiview once the whole array is verified.** On a VERIFY
+  PASS, Manual Assist drops out of the single-camera fullscreen feed back to the
+  grid so the operator sees every tile confirmed at once.
 - Rewrote `README.md` as a product-facing overview (removed internal
   phase/bench-spike framing and predecessor-project references).
+
+### Fixed
+- **Bench evidence capture now fails closed across reconnects and export errors.**
+  Capture preflight locks the camera and livestream generation before accepting
+  JPEGs; stale URL-session callbacks, missing start/end rect read-backs, quality
+  changes, and stream restarts cannot be certified. The trial CSV is regenerated
+  atomically from manifest state so an export failure cannot leave a stale
+  `complete` summary.
+- **Capture Target & Start no longer rejects a fully-seeded array during a
+  livestream flap.** The Manual Assist precondition check was a single
+  instantaneous snapshot: if one camera happened to be mid-restart (auto-recover
+  restarts and brief `The request timed out` drops are routine on a busy bench)
+  at the exact moment the operator pressed the button, the whole capture was
+  refused with "Start the livestream on every connected camera…" even though
+  every sphere was seeded and solved. The check is now a bounded readiness wait
+  (`manualReadyGrace`, 12 s): it polls until every connected camera is
+  stream-live and holding a measurable sphere lock, exits as soon as the array
+  is ready, and only fails — naming the specific cameras and reasons — if a
+  camera never recovers within the window. `captureManualBaselines` was hardened
+  the same way: it now exits early once every camera has its samples but tolerates
+  a camera briefly mid-restart instead of aborting the calibration.
 
 ## [1.0.0] — 2026-07-21
 

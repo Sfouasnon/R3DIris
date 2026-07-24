@@ -28,11 +28,21 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
     @Published private(set) var stats = Stats()
     @Published private(set) var isStreaming = false
     @Published private(set) var lastError: String = ""
+    /// Changes on every stop/start boundary. Bench capture preflight freezes this
+    /// token so metadata from one camera can never be paired with a replacement
+    /// stream generation.
+    private(set) var generation: UInt64 = 0
 
     var onLog: ((String) -> Void)?
     /// Called on the main actor for every decoded frame — the analysis hook
     /// (CameraNode throttles; do NOT do heavy work synchronously in here).
     var onFrame: ((CGImage) -> Void)?
+    /// Called on the main actor for every exact SOI…EOI JPEG payload before
+    /// display-side freshest-frame dropping or ImageIO decoding. Bench
+    /// validation uses this to preserve the untouched port-9090 evidence.
+    /// The callback must only enqueue/copy the payload; never analyze or write
+    /// it synchronously on the stream's main-actor receive path.
+    var onJPEG: ((Data, Date) -> Void)?
     /// Decode only the newest buffered frame per callback (drop stale ones) to
     /// keep display latency from creeping. Set by ArrayController.
     var dropToLatestFrame = true
@@ -48,6 +58,7 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
 
     func start(ip: String) {
         stop()
+        generation &+= 1
         guard let url = URL(string: "http://\(ip):\(RCP2.livestreamPort)/") else {
             lastError = "bad URL"
             return
@@ -74,6 +85,7 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
     }
 
     func stop() {
+        generation &+= 1
         task?.cancel()
         task = nil
         session?.invalidateAndCancel()
@@ -86,9 +98,9 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
 
     // MARK: - JPEG extraction
 
-    private func consume(_ data: Data) {
+    private func consume(_ data: Data, receivedAt: Date) {
         buffer.append(data)
-        let now = Date()
+        let now = receivedAt
         byteWindow.append((now, data.count))
         byteWindow.removeAll { now.timeIntervalSince($0.0) > 3 }
         let windowBytes = byteWindow.reduce(0) { $0 + $1.1 }
@@ -113,7 +125,11 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
         // stat and the stall watchdog. Off ⇒ decode every frame (original behavior).
         var latest: Data? = nil
         while let jpeg = extractNextJPEG() {
-            recordArrival()
+            // URLSession timestamps bytes by delegate chunk before the MainActor
+            // hop. If one chunk completes multiple JPEGs, they intentionally
+            // share that chunk-arrival timestamp.
+            onJPEG?(jpeg, receivedAt)
+            recordArrival(at: receivedAt)
             if dropToLatestFrame {
                 latest = jpeg
             } else {
@@ -152,8 +168,7 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
 
     /// Count a received frame — fps and the stall watchdog reflect the true
     /// stream rate even when freshest-frame drops some before decode.
-    private func recordArrival() {
-        let now = Date()
+    private func recordArrival(at now: Date) {
         stats.frames += 1
         stats.lastFrameAt = now
         frameTimes.append(now)
@@ -188,6 +203,7 @@ extension MJPEGStreamReader: URLSessionDataDelegate {
                                 completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         completionHandler(.allow)
         Task { @MainActor in
+            guard self.session === session, self.task === dataTask else { return }
             guard !self.headerLogged else { return }
             self.headerLogged = true
             if let http = response as? HTTPURLResponse {
@@ -203,17 +219,23 @@ extension MJPEGStreamReader: URLSessionDataDelegate {
     }
 
     nonisolated func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let receivedAt = Date()
         Task { @MainActor in
-            self.consume(data)
+            guard self.session === session, self.task === dataTask else { return }
+            self.consume(data, receivedAt: receivedAt)
         }
     }
 
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         Task { @MainActor in
+            guard self.session === session, self.task === task else { return }
             if let error, (error as NSError).code != NSURLErrorCancelled {
                 self.lastError = error.localizedDescription
                 self.onLog?("livestream: ended with error — \(error.localizedDescription)")
             }
+            session.finishTasksAndInvalidate()
+            self.task = nil
+            self.session = nil
             self.isStreaming = false
         }
     }

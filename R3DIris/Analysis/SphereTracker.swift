@@ -75,8 +75,8 @@ struct SphereTracker {
             if state.seeded {
                 misses = 0
                 state.phase = .locked
-                state.heroIRE = det.heroIRE ?? state.heroIRE
-                if det.heroIRE != nil { state.measuredAt = Date() }
+                state.heroIRE = det.heroIRE
+                state.measuredAt = det.heroIRE == nil ? nil : Date()
                 state.detail = "locked (operator seed)"
                 return
             }
@@ -97,7 +97,7 @@ struct SphereTracker {
                 state.cx = nx; state.cy = ny; state.r = nr
             }
             state.heroIRE = det.heroIRE
-            state.measuredAt = Date()
+            state.measuredAt = det.heroIRE == nil ? nil : Date()
             if hits >= Self.hitsToLock {
                 state.phase = .locked
                 state.detail = det.status == .successPass2 ? "locked (gating-2)" : "locked"
@@ -115,8 +115,8 @@ struct SphereTracker {
                     // at the fixed ROI, never time out.
                     misses = 0
                     state.phase = .locked
-                    state.heroIRE = det.heroIRE ?? state.heroIRE
-                    if det.heroIRE != nil { state.measuredAt = Date() }
+                    state.heroIRE = det.heroIRE
+                    state.measuredAt = det.heroIRE == nil ? nil : Date()
                     state.detail = "locked (operator seed)"
                 } else {
                     misses += 1
@@ -124,8 +124,8 @@ struct SphereTracker {
                     if state.phase == .searching {
                         reset(detail: "lock lost (\(misses) misses)")
                     } else {
-                        state.heroIRE = det.heroIRE ?? state.heroIRE
-                        if det.heroIRE != nil { state.measuredAt = Date() }
+                        state.heroIRE = det.heroIRE
+                        state.measuredAt = det.heroIRE == nil ? nil : Date()
                         state.detail = "coasting (\(misses))"
                     }
                 }
@@ -175,7 +175,7 @@ struct SphereTracker {
         state.cy = cy
         state.r = r
         state.heroIRE = heroIRE
-        state.measuredAt = Date()
+        state.measuredAt = heroIRE == nil ? nil : Date()
         state.seeded = true
         state.detail = "locked (operator seed)"
     }

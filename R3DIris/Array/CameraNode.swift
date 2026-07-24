@@ -75,6 +75,7 @@ final class CameraNode: ObservableObject, Identifiable {
     /// Hough-vs-gate question can be answered from the shared log.
     var diagnosticsEnabled = false
     private var lastDetectLogAt = Date.distantPast
+    private var lastNativeProbeFailureLogAt = Date.distantPast
 
     private var currentAnalysisInterval: TimeInterval {
         if focusedTrim && tracker.state.seeded { return Self.frozenAnalysisInterval }
@@ -85,6 +86,7 @@ final class CameraNode: ObservableObject, Identifiable {
     private var lastAnalysis = Date.distantPast
 
     var onLog: ((String) -> Void)?
+    var onStatusChange: ((CameraNode) -> Void)?
 
     func attachSoakRecorder(_ recorder: SoakRecorder?) {
         soakRecorder = recorder
@@ -109,7 +111,11 @@ final class CameraNode: ObservableObject, Identifiable {
             ip: ip,
             sourceIP: sourceIP,
             onStatus: { [weak self] s in
-                Task { @MainActor in self?.status = s }
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.status = s
+                    self.onStatusChange?(self)
+                }
             },
             onLog: { [weak self] line in
                 Task { @MainActor in
@@ -138,6 +144,7 @@ final class CameraNode: ObservableObject, Identifiable {
         frozenSince = nil
         lastFingerprint = 0
         streamingDesired = false
+        onStatusChange?(self)
     }
 
     func refresh() {
@@ -164,7 +171,14 @@ final class CameraNode: ObservableObject, Identifiable {
             // Q100 (or the array's chosen quality), read-back verified — the
             // camera never pushes LIVESTREAM_QUALITY, so this is the only proof
             // it actually took (soak finding 2026-07-20).
-            _ = await cam.setLivestreamQuality(desiredQuality)
+            let quality = await cam.setLivestreamQuality(desiredQuality)
+            guard let actual = quality.actual else {
+                onLog?("[\(ip)] stream: NOT OPENED — LIVESTREAM_QUALITY has no actual read-back")
+                return
+            }
+            if actual != desiredQuality {
+                onLog?("[\(ip)] stream: requested \(RCP2.livestreamQualityLabels[desiredQuality] ?? "\(desiredQuality)"), camera actual \(RCP2.livestreamQualityLabels[actual] ?? "\(actual)"); array measurement remains blocked until participant read-backs agree")
+            }
             try? await Task.sleep(nanoseconds: 700_000_000)
             stream.start(ip: ip)
         }
@@ -231,10 +245,10 @@ final class CameraNode: ObservableObject, Identifiable {
                 let prior = trackerSnapshot.prior(forBufferWidth: buf.width, height: buf.height)
                 if trackerSnapshot.state.seeded, let prior {
                     // Operator-approved lock is FROZEN: never re-detect or move
-                    // it. Measure hero IRE at the fixed ROI so the reading stays
-                    // live, and let the tracker hold the lock in place.
+                    // it. The common native-probe step below measures hero IRE
+                    // at the fixed ROI while the tracker holds the lock.
                     detection = SphereDetection(status: .coasting, roi: prior,
-                                                heroIRE: SphereDetector.measure(in: buf, roi: prior),
+                                                heroIRE: nil,
                                                 gates: [], failureReason: "seeded",
                                                 bufferWidth: buf.width, bufferHeight: buf.height)
                 } else {
@@ -245,10 +259,25 @@ final class CameraNode: ObservableObject, Identifiable {
                     if det.status == .failed, let prior,
                        trackerSnapshot.state.phase == .locked || trackerSnapshot.state.phase == .coasting {
                         det = SphereDetection(status: .coasting, roi: prior,
-                                              heroIRE: SphereDetector.measure(in: buf, roi: prior),
+                                              heroIRE: nil,
                                               gates: det.gates, failureReason: det.failureReason,
                                               bufferWidth: buf.width, bufferHeight: buf.height)
                     }
+                    detection = det
+                }
+                // Detect, gate, and maintain geometry in the 480 px working
+                // buffer, then reproject only the approved center probe onto
+                // the decoded native frame (normally 1920×1080). Overwrite the
+                // detector's low-resolution estimate even when the native
+                // probe fails; a nil reading is safer than silently mixing
+                // measurement resolutions.
+                if var det = detection, let roi = det.roi {
+                    det.heroIRE = NativeIREProbe.measureHero(
+                        in: handle.image,
+                        detectionROI: roi,
+                        bufferWidth: det.bufferWidth,
+                        bufferHeight: det.bufferHeight
+                    )?.ire
                     detection = det
                 }
                 grid = WaveformGrid.compute(from: buf)
@@ -289,6 +318,18 @@ final class CameraNode: ObservableObject, Identifiable {
         if let detection {
             tracker.update(with: detection)
             sphere = tracker.state
+            if detection.roi != nil, detection.heroIRE == nil {
+                let now = Date()
+                if now.timeIntervalSince(lastNativeProbeFailureLogAt) >= 3.0 {
+                    lastNativeProbeFailureLogAt = now
+                    let dimensions = "\(stream.stats.width)×\(stream.stats.height)"
+                    let requirement = stream.stats.width == NativeIREProbe.requiredSourceWidth
+                        && stream.stats.height == NativeIREProbe.requiredSourceHeight
+                        ? ""
+                        : "; matching requires 1920×1080"
+                    onLog?("[\(ip)] measure: native ROI probe unavailable (\(dimensions)\(requirement)) — no 480 px fallback used")
+                }
+            }
         }
         if let grid { waveform = grid }
         // Detector diagnostics: only the auto-solve path (unseeded), throttled,
@@ -381,10 +422,16 @@ final class CameraNode: ObservableObject, Identifiable {
         }
         let w = Double(buf.width), h = Double(buf.height)
         let roi = SphereROI(cx: p.cx * w, cy: p.cy * h, r: p.r * w)
-        let hero = SphereDetector.measure(in: buf, roi: roi)
+        let hero = NativeIREProbe.measureHero(
+            in: img,
+            normalizedCenterX: p.cx,
+            normalizedCenterY: p.cy,
+            normalizedRadiusByWidth: p.r
+        )?.ire
         tracker.manualLock(cx: p.cx, cy: p.cy, r: p.r, heroIRE: hero)
         sphere = tracker.state
-        let sig = SphereDetector.profile(at: roi, in: buf)
+        var sig = SphereDetector.profile(at: roi, in: buf)
+        sig.heroIRE = hero
         seedSignature = sig   // the hero keeps its own signature too
         onLog?("[\(ip)] sphere: seed approved r=\(Int(roi.r))px heroIRE=\(hero.map { String(format: "%.1f", $0) } ?? "n/a")")
         pendingSeed = nil
@@ -411,10 +458,16 @@ final class CameraNode: ObservableObject, Identifiable {
         let cx = tracker.state.cx, cy = tracker.state.cy, r = tracker.state.r
         let w = Double(buf.width), h = Double(buf.height)
         let roi = SphereROI(cx: cx * w, cy: cy * h, r: r * w)
-        let hero = SphereDetector.measure(in: buf, roi: roi)
+        let hero = NativeIREProbe.measureHero(
+            in: img,
+            normalizedCenterX: cx,
+            normalizedCenterY: cy,
+            normalizedRadiusByWidth: r
+        )?.ire
         tracker.manualLock(cx: cx, cy: cy, r: r, heroIRE: hero)
         sphere = tracker.state
-        let sig = SphereDetector.profile(at: roi, in: buf)
+        var sig = SphereDetector.profile(at: roi, in: buf)
+        sig.heroIRE = hero
         seedSignature = sig
         pendingSeed = nil
         onLog?("[\(ip)] sphere: accepted auto mask r=\(Int(roi.r))px heroIRE=\(hero.map { String(format: "%.1f", $0) } ?? "n/a")")
@@ -434,22 +487,6 @@ final class CameraNode: ObservableObject, Identifiable {
     func unfreezeTransformLock() {
         tracker.unfreeze()
         sphere = tracker.state
-    }
-
-    /// Apply a livestream quality now (and remember it for the next stream
-    /// start). Read-back verified inside CameraActor.
-    func applyQuality(_ q: Int) {
-        desiredQuality = q
-        guard let cam = camera else { return }
-        Task { _ = await cam.setLivestreamQuality(q) }
-    }
-
-    /// Apply a livestream quality now WITHOUT changing the remembered baseline —
-    /// used to temporarily drop the focused camera for latency and restore it to
-    /// `desiredQuality` afterward.
-    func applyLiveQuality(_ q: Int) {
-        guard let cam = camera else { return }
-        Task { _ = await cam.setLivestreamQuality(q) }
     }
 
     private func updateStreamHealth(fingerprint: UInt64) {

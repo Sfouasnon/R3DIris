@@ -17,35 +17,65 @@ final class BenchController: ObservableObject {
     @Published var apertureSubscribed = false
 
     let stream = MJPEGStreamReader()
+    let validation = IREValidationController()
 
     private var camera: CameraActor?
+    private var requestedLivestreamQuality: Int?
+    private var cameraGeneration: UInt64 = 0
 
     init() {
         stream.onLog = { [weak self] line in self?.log(line) }
+        stream.onJPEG = { [weak self] jpeg, receivedAt in
+            guard let self else { return }
+            self.validation.receiveJPEG(jpeg, at: receivedAt, cameraStatus: self.status)
+        }
+        validation.onLog = { [weak self] line in self?.log(line) }
+        validation.onFinalizeRequested = { [weak self] reason in
+            self?.finalizeIREValidationCapture(reason)
+        }
     }
 
     // MARK: - Session lifecycle
 
     func connect() {
-        let ip = ip.trimmingCharacters(in: .whitespaces)
-        guard !ip.isEmpty else { return }
+        guard !validation.isBusy else {
+            log("connect REFUSED — wait for IRE validation preflight/capture/processing to finish")
+            return
+        }
+        let targetIP = ip.trimmingCharacters(in: .whitespaces)
+        guard !targetIP.isEmpty else { return }
         disconnect()
-        log("connecting to \(ip) (WS :\(RCP2.wsPort))…")
+        cameraGeneration &+= 1
+        let connectionGeneration = cameraGeneration
+        log("connecting to \(targetIP) (WS :\(RCP2.wsPort))…")
         let src = sourceIP.trimmingCharacters(in: .whitespaces)
         let cam = CameraActor(
-            ip: ip,
+            ip: targetIP,
             sourceIP: src.isEmpty ? nil : src,
             onStatus: { [weak self] s in
-                Task { @MainActor in self?.status = s }
+                Task { @MainActor in
+                    guard let self,
+                          self.cameraGeneration == connectionGeneration else { return }
+                    self.status = s
+                }
             },
             onLog: { [weak self] line in
-                Task { @MainActor in self?.log(line) }
+                Task { @MainActor in
+                    guard let self,
+                          self.cameraGeneration == connectionGeneration else { return }
+                    self.log(line)
+                }
             })
         camera = cam
         Task { await cam.start() }
     }
 
     func disconnect() {
+        if validation.isBusy {
+            log("disconnect REFUSED — wait for IRE validation preflight/capture/processing to finish")
+            return
+        }
+        cameraGeneration &+= 1
         stream.stop()
         if let cam = camera {
             camera = nil
@@ -54,9 +84,14 @@ final class BenchController: ObservableObject {
         }
         status = CameraStatus()
         apertureSubscribed = false
+        requestedLivestreamQuality = nil
     }
 
     func refresh() {
+        guard !validation.isBusy else {
+            log("refresh REFUSED — camera identity is locked for IRE validation")
+            return
+        }
         guard let cam = camera else { connect(); return }
         Task { await cam.revive() }
     }
@@ -108,6 +143,10 @@ final class BenchController: ObservableObject {
 
     /// Step 3 — valid stop list for the mounted lens.
     func getApertureList() {
+        guard !validation.isBusy else {
+            log("aperture list REFUSED — IRE validation owns the camera state")
+            return
+        }
         guard let cam = camera else { return }
         Task {
             let list = await cam.getApertureList()
@@ -120,6 +159,10 @@ final class BenchController: ObservableObject {
     }
 
     func toggleApertureSubscription() {
+        guard !validation.isBusy else {
+            log("APERTURE subscription change REFUSED — IRE validation owns the camera state")
+            return
+        }
         guard let cam = camera else { return }
         apertureSubscribed.toggle()
         let on = apertureSubscribed
@@ -128,6 +171,10 @@ final class BenchController: ObservableObject {
 
     /// Step 4 — absolute set; watch pushed cur converge to target for settle time.
     func setAperture(stopX10: Int) {
+        guard !validation.isBusy else {
+            log("APERTURE set REFUSED — exposure is locked for the active IRE validation capture")
+            return
+        }
         guard let cam = camera else { return }
         let sentAt = Date()
         Task {
@@ -148,6 +195,10 @@ final class BenchController: ObservableObject {
 
     /// Step 5 — single list-step nudge.
     func nudgeAperture(_ offset: Int) {
+        guard !validation.isBusy else {
+            log("APERTURE nudge REFUSED — exposure is locked for the active IRE validation capture")
+            return
+        }
         guard let cam = camera else { return }
         Task { _ = await cam.nudgeAperture(offset: offset) }
     }
@@ -156,6 +207,10 @@ final class BenchController: ObservableObject {
 
     /// Step 1 — enable over WS, then GET :9090.
     func enableLivestreamAndView() {
+        guard !validation.isBusy else {
+            log("livestream start REFUSED — cancel the active IRE validation capture first")
+            return
+        }
         guard let cam = camera else { return }
         let ip = ip.trimmingCharacters(in: .whitespaces)
         Task {
@@ -166,6 +221,10 @@ final class BenchController: ObservableObject {
     }
 
     func stopLivestream() {
+        if validation.isBusy {
+            log("livestream stop REFUSED — cancel the active IRE validation capture first")
+            return
+        }
         stream.stop()
         guard let cam = camera else { return }
         Task { _ = await cam.setLivestream(enabled: false) }
@@ -173,7 +232,12 @@ final class BenchController: ObservableObject {
 
     /// Step 4 — quality. Measure at 4 (Q100): low-Q JPEG perturbs patch stats.
     func setQuality(_ q: Int) {
+        if validation.isBusy {
+            log("LIVESTREAM_QUALITY change REFUSED — actual read-back is locked for the active IRE validation capture")
+            return
+        }
         guard let cam = camera else { return }
+        requestedLivestreamQuality = q
         Task { _ = await cam.setLivestreamQuality(q) }
     }
 
@@ -188,6 +252,79 @@ final class BenchController: ObservableObject {
         benchGet(RCP2.livestreamRectPixelsParam) { _ in
             // raw payload already logged by benchGet; parsed rect lands in status
         }
+    }
+
+    // MARK: - Bench actions: IRE validation against 10-bit SDI / Nobe
+
+    /// Refresh every camera-side value included in an IRE evidence trial.
+    /// Quality is an explicit GET because it is not subscribed/pushed.
+    func prepareIREValidation() {
+        guard let cam = camera else {
+            log("IRE validation prepare REFUSED — connect the camera first")
+            return
+        }
+        guard validation.beginPreflight("Refreshing actual camera read-backs…") else {
+            log("IRE validation prepare REFUSED — validation is already busy")
+            return
+        }
+        let frozenCameraGeneration = cameraGeneration
+        Task {
+            _ = await readValidationMetadata(from: cam)
+            guard cameraGeneration == frozenCameraGeneration, camera === cam else {
+                validation.endPreflight(
+                    "Camera changed during metadata refresh; read-backs were discarded."
+                )
+                return
+            }
+            let message =
+                "Metadata refreshed; approve the native-frame ROI and enter the simultaneous Nobe value."
+            validation.endPreflight(message)
+            log("IRE validation: \(message)")
+        }
+    }
+
+    /// Re-reads actual quality and active monitor transform immediately before
+    /// accepting any JPEGs. The controller then freezes quality-changing UI
+    /// until a final read-back closes the trial.
+    func startIREValidationCapture() {
+        guard let cam = camera else {
+            validation.reportIssue("Connect the camera first.")
+            return
+        }
+        guard validation.beginPreflight(
+            "Freezing camera/stream identity and refreshing final read-backs…"
+        ) else { return }
+        let frozenCameraGeneration = cameraGeneration
+        let frozenStreamGeneration = stream.generation
+        let frozenIP = ip.trimmingCharacters(in: .whitespaces)
+        let frozenRequestedQuality = requestedLivestreamQuality
+        Task {
+            let snapshot = await readValidationMetadata(from: cam)
+            guard cameraGeneration == frozenCameraGeneration, camera === cam,
+                  ip.trimmingCharacters(in: .whitespaces) == frozenIP else {
+                validation.endPreflight(
+                    "Camera identity changed during capture preflight; capture was not started."
+                )
+                return
+            }
+            guard stream.generation == frozenStreamGeneration, stream.isStreaming else {
+                validation.endPreflight(
+                    "Livestream restarted or stopped during capture preflight; capture was not started."
+                )
+                return
+            }
+            _ = validation.beginCapture(
+                ip: frozenIP,
+                cameraStatus: snapshot,
+                streamStats: stream.stats,
+                streamIsLive: stream.isStreaming,
+                requestedQuality: frozenRequestedQuality
+            )
+        }
+    }
+
+    func cancelIREValidationCapture() {
+        validation.requestCancel()
     }
 
     // MARK: - Log
@@ -220,6 +357,10 @@ final class BenchController: ObservableObject {
     /// param that can mean a WEDGED session (rule 11): watch whether TC keeps
     /// ticking; reconnect clears it.
     private func benchGet(_ pid: String, _ handle: @escaping @MainActor ([String: Any]?) -> Void) {
+        guard !validation.isBusy else {
+            log("\(pid) GET REFUSED — IRE validation owns the camera transaction queue")
+            return
+        }
         guard let cam = camera else { return }
         Task {
             let msg = await cam.benchGet(pid)
@@ -232,5 +373,56 @@ final class BenchController: ObservableObject {
             }
             handle(msg)
         }
+    }
+
+    private func readValidationMetadata(from cam: CameraActor) async -> CameraStatus {
+        _ = await cam.getLivestreamQualityOptions()
+        _ = await cam.readLivestreamQuality()
+        // Clear before the GET so a timeout, error wrapper, or malformed reply
+        // can never inherit an older rect as fresh trial provenance.
+        await cam.clearLivestreamRectReadback()
+        for pid in [RCP2.livestreamMirrorSourceParam, RCP2.livestreamRectPixelsParam] {
+            let message = await cam.benchGet(pid)
+            logRawReply(pid: pid, message: message)
+            if pid == RCP2.livestreamRectPixelsParam,
+               !isFreshCurrentReply(message, parameterID: pid) {
+                await cam.clearLivestreamRectReadback()
+            }
+        }
+        _ = await cam.readActiveMonitorTransform()
+        return await cam.currentStatus()
+    }
+
+    private func finalizeIREValidationCapture(_ reason: IREValidationFinalizeReason) {
+        guard let cam = camera else {
+            validation.finishCapture(endStatus: status, benchLog: logText())
+            return
+        }
+        Task {
+            // Repeat the full provenance read, not only quality: a changed
+            // mirror output, Log3G10 Look, or stream rect also invalidates—but
+            // never deletes—the evidence.
+            let endStatus = await readValidationMetadata(from: cam)
+            validation.finishCapture(endStatus: endStatus, benchLog: logText())
+        }
+    }
+
+    private func logRawReply(pid: String, message: [String: Any]?) {
+        if let message,
+           let data = try? JSONSerialization.data(withJSONObject: message, options: [.sortedKeys]),
+           let raw = String(data: data, encoding: .utf8) {
+            log("← \(raw)")
+        } else {
+            log("← \(pid): NO REPLY")
+        }
+    }
+
+    private func isFreshCurrentReply(_ message: [String: Any]?,
+                                     parameterID: String) -> Bool {
+        guard let message,
+              RCP2.normParamID(message["id"]) == parameterID,
+              let type = message["type"] as? String,
+              type.hasPrefix("rcp_cur_") else { return false }
+        return true
     }
 }

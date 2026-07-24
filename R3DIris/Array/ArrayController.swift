@@ -52,15 +52,6 @@ final class ArrayController: ObservableObject {
     @Published var dropStaleFrames = true {
         didSet { for n in nodes { n.stream.dropToLatestFrame = dropStaleFrames } }
     }
-    /// Temporarily lower the fullscreen-focused camera's stream quality while
-    /// trimming it — smaller frames, less encode/transmit/decode lag on the one
-    /// camera a hand is on; other cameras keep full quality. Restored on unfocus.
-    @Published var lowerFocusStreamQuality = false
-    /// Q25 — enough of a size cut to matter; the focused camera is frozen and
-    /// measured at a fixed ROI, so the flatter JPEG doesn't affect its reading.
-    private static let focusLowQuality = 1
-    private var focusQualityNodeID: UUID?
-
     // MARK: Discovery (V3's method, ported: TCP subnet sweep on :9998 primary,
     // UDP CAMINFO broadcast fallback — both spend ZERO camera session slots.
     // Manual IP entry remains as the fallback path.)
@@ -75,6 +66,40 @@ final class ArrayController: ObservableObject {
     // Every push is read-back verified per body (CameraActor). Drop it only if
     // viewing many streams strains the GigE segment — LIVESTREAM_NOTES ch.7.
     @Published var arrayQuality: Int = 4   // 1=Q25 2=Q50 3=Q75 4=Q100
+    @Published private(set) var arrayActualQuality: Int? = nil
+    @Published private(set) var arrayQualityStatus = "Not verified across participants."
+    @Published private(set) var qualityVerificationInProgress = false
+    @Published private(set) var qualityControlsLocked = false
+    /// Exact camera membership covered by `arrayActualQuality`. Electronic Match
+    /// intentionally verifies only participating e-iris bodies, while Manual
+    /// Assist verifies every connected body; status from an excluded camera must
+    /// not erase proof for a different set.
+    private var qualityVerifiedParticipantIDs: Set<UUID> = []
+
+    /// Intersection of runtime factors advertised by every connected body.
+    /// Until all bodies have answered `rcp_get_list`, expose the four documented
+    /// protocol factors; after a verification pass, the picker reflects only
+    /// choices the whole active array says it shares.
+    var commonLivestreamQualityOptions: [LivestreamQualityOption] {
+        let connected = nodes.filter(\.connected)
+        let lists = connected.map(\.status.livestreamQualityOptions).filter { !$0.isEmpty }
+        guard !connected.isEmpty, lists.count == connected.count else {
+            return (1...4).map {
+                .init(value: $0, label: RCP2.livestreamQualityLabels[$0] ?? "\($0)")
+            }
+        }
+        var common = Set(lists[0].map(\.value))
+        for list in lists.dropFirst() { common.formIntersection(Set(list.map(\.value))) }
+        return common.sorted().map { value in
+            let labels = Set(lists.compactMap { list in
+                list.first(where: { $0.value == value })?.label
+            })
+            let label = labels.count == 1
+                ? labels.first!
+                : (RCP2.livestreamQualityLabels[value] ?? "\(value)")
+            return .init(value: value, label: label)
+        }
+    }
 
     var subnetHostCount: Int { Subnet.hosts(from: subnet).count }
 
@@ -216,22 +241,6 @@ final class ArrayController: ObservableObject {
         node.status.displayID.isEmpty ? node.ip : node.status.displayID
     }
 
-    /// Drop the focused camera's stream quality (and restore the previously
-    /// lowered one) when the low-latency-focus option is on. Called each manual
-    /// tick but only sends RCP on an actual change. `restoreOnly` on teardown.
-    private func applyFocusStreamQuality(restoreOnly: Bool = false) {
-        let target: UUID? = (restoreOnly || !lowerFocusStreamQuality) ? nil : fullScreenNodeID
-        guard focusQualityNodeID != target else { return }
-        if let prev = focusQualityNodeID, let n = nodes.first(where: { $0.id == prev }) {
-            n.applyLiveQuality(n.desiredQuality)
-        }
-        if let tid = target, let n = nodes.first(where: { $0.id == tid }) {
-            n.applyLiveQuality(Self.focusLowQuality)
-            log("latency: \(manualIDKey(n)) stream → \(RCP2.livestreamQualityLabels[Self.focusLowQuality] ?? "?") while focused")
-        }
-        focusQualityNodeID = target
-    }
-
     /// Move fullscreen focus (and selection) to a camera during the guided flow.
     private func focusManual(on node: CameraNode) {
         guard fullScreenNodeID != node.id else { return }
@@ -243,10 +252,21 @@ final class ArrayController: ObservableObject {
     private var manualEndRequested = false
     private var manualEndMessage = "Manual Assist aborted by operator."
     private var manualEndWasFailure = false
+    /// Immutable actual quality captured by the Manual Assist preflight. This
+    /// remains available long enough to fail closed even after the UI's aggregate
+    /// proof is invalidated by a reconnect or missing read-back.
+    private var manualExpectedQuality: Int?
 
     static let settleTimeout: TimeInterval = 10
     static let measureTimeout: TimeInterval = 6
     static let maxRounds = 16
+    /// How long "Capture Target & Start" waits for every connected camera to be
+    /// stream-live and sphere-locked before it gives up. On a busy bench the
+    /// livestreams flap (auto-recover restarts, brief timeouts), so a single
+    /// instantaneous snapshot would reject a fully-seeded array just because one
+    /// camera happened to be mid-restart at the click. This bound covers a
+    /// stream restart's enable delay + first-frame settle with margin.
+    static let manualReadyGrace: TimeInterval = 12
 
     // MARK: - Stream auto-recovery
     /// Automatically restart a participant's livestream if it drops or stalls.
@@ -442,12 +462,115 @@ final class ArrayController: ObservableObject {
 
     // MARK: - Livestream quality
 
-    /// Push the array-wide quality to every connected body, read-back verified
-    /// per camera (CameraActor logs any that don't echo the value).
+    /// Push one exact RCP2 quality factor to every connected body, then compare
+    /// the independent actual read-backs. A requested value is never treated as
+    /// measurement truth.
     func setQualityAll() {
+        guard !qualityControlsLocked, !manualSessionActive, !qualityVerificationInProgress else {
+            log("array quality: change BLOCKED while a measurement workflow owns the quality lock")
+            return
+        }
         let q = arrayQuality
-        log("array quality: LIVESTREAM_QUALITY \(q) (\(RCP2.livestreamQualityLabels[q] ?? "?")) → \(nodes.count) camera(s), verified per body")
-        for node in nodes { node.applyQuality(q) }
+        let targets = nodes.filter(\.connected)
+        guard !targets.isEmpty else {
+            arrayQualityStatus = "No connected cameras to verify."
+            return
+        }
+        qualityVerificationInProgress = true
+        Task {
+            _ = await verifyUniformLivestreamQuality(targets, requested: q,
+                                                     context: "operator apply")
+            qualityVerificationInProgress = false
+        }
+    }
+
+    /// Set + read back quality on every camera actor. Measurement may begin only
+    /// if every participant returns a value
+    /// and those ACTUAL values are identical. If every camera clamps to the same
+    /// value, adopt that value as the array setting and remember it for restarts.
+    private func verifyUniformLivestreamQuality(_ parts: [CameraNode],
+                                                requested: Int,
+                                                context: String) async -> Bool {
+        guard !parts.isEmpty else { return false }
+        arrayActualQuality = nil
+        qualityVerifiedParticipantIDs.removeAll()
+        arrayQualityStatus = "Reading camera quality factors…"
+        log("array quality: \(context) — request \(RCP2.livestreamQualityLabels[requested] ?? "\(requested)") on \(parts.count) participant(s), then compare actual read-back")
+
+        var cameras: [(UUID, CameraActor)] = []
+        for node in parts {
+            guard let camera = node.camera else {
+                arrayQualityStatus = "Blocked: \(node.displayName) has no camera session."
+                log("array quality: BLOCKED — \(node.ip) has no CameraActor")
+                return false
+            }
+            cameras.append((node.id, camera))
+        }
+
+        // Each body owns an independent actor/session whose request transactions
+        // remain serialized internally. Verify bodies concurrently so an array
+        // preflight costs one RCP timeout window, not N timeout windows.
+        var byID: [UUID: LivestreamQualityVerification] = [:]
+        await withTaskGroup(of: (UUID, LivestreamQualityVerification).self) { group in
+            for (id, camera) in cameras {
+                group.addTask {
+                    (id, await camera.setLivestreamQuality(requested))
+                }
+            }
+            for await (id, verification) in group {
+                byID[id] = verification
+            }
+        }
+        let readings = parts.compactMap { node in byID[node.id].map { (node, $0) } }
+
+        let missing = readings.filter { $0.1.actual == nil }.map { $0.0.displayName }
+        guard missing.isEmpty else {
+            arrayQualityStatus = "Blocked: no actual quality read-back from \(missing.joined(separator: ", "))."
+            log("array quality: BLOCKED — missing actual read-back: \(missing.joined(separator: ", "))")
+            return false
+        }
+
+        let actualValues = Set(readings.compactMap { $0.1.actual })
+        guard actualValues.count == 1, let actual = actualValues.first else {
+            let detail = readings.map {
+                "\($0.0.displayName)=\($0.1.actual.flatMap { RCP2.livestreamQualityLabels[$0] } ?? "NO REPLY")"
+            }.joined(separator: ", ")
+            arrayQualityStatus = "Blocked: participant read-backs differ (\(detail))."
+            log("array quality: MISMATCH / measurement BLOCKED — \(detail)")
+            return false
+        }
+
+        arrayActualQuality = actual
+        qualityVerifiedParticipantIDs = Set(parts.map(\.id))
+        arrayQuality = actual
+        for (node, _) in readings { node.desiredQuality = actual }
+        let label = RCP2.livestreamQualityLabels[actual] ?? "\(actual)"
+        let clamp = actual == requested ? "" : " (camera-selected; requested \(RCP2.livestreamQualityLabels[requested] ?? "\(requested)"))"
+        arrayQualityStatus = "Locked \(label) across \(parts.count) actual read-backs\(clamp)."
+        log("array quality: PASS — every participant actual read-back \(label)\(clamp)")
+        return true
+    }
+
+    /// A verified array value is evidence about the cameras' *current* actual
+    /// read-backs, not a sticky preference. Reconnects clear CameraActor state,
+    /// and an external quality change can arrive at any time, so invalidate the
+    /// array proof as soon as any participant no longer reports the value that
+    /// was verified.
+    private func participantStatusDidChange(_ node: CameraNode) {
+        guard qualityVerifiedParticipantIDs.contains(node.id) else { return }
+        guard let verified = arrayActualQuality else { return }
+        guard node.connected, node.status.livestreamQuality == verified else {
+            arrayActualQuality = nil
+            qualityVerifiedParticipantIDs.removeAll()
+            if node.connected {
+                arrayQualityStatus =
+                    "Actual quality proof lost on \(node.displayName); re-verify before measurement."
+            } else {
+                arrayQualityStatus =
+                    "\(node.displayName) disconnected; actual quality must be re-verified."
+            }
+            return
+        }
     }
 
     // MARK: - Sphere seeding (operator click → array-wide signature)
@@ -523,10 +646,17 @@ final class ArrayController: ObservableObject {
         guard !nodes.contains(where: { $0.ip == ip }) else { return }
         let node = CameraNode(ip: ip)
         node.onLog = { [weak self] line in self?.log(line) }
+        node.onStatusChange = { [weak self] node in
+            self?.participantStatusDidChange(node)
+        }
         node.diagnosticsEnabled = logSphereDiagnostics
+        node.desiredQuality = arrayQuality
         node.stream.dropToLatestFrame = dropStaleFrames
         if soak.isRecording { node.attachSoakRecorder(soak) }
         nodes.append(node)
+        arrayActualQuality = nil
+        qualityVerifiedParticipantIDs.removeAll()
+        arrayQualityStatus = "Array changed; actual quality must be re-verified."
         if selectedNodeID == nil { selectedNodeID = node.id }
         log("added \(ip)\(label.isEmpty ? "" : " (\(label))")")
         // Auto-connect on add so the array comes up hands-free — discovered or
@@ -547,6 +677,9 @@ final class ArrayController: ObservableObject {
         node.attachSoakRecorder(nil)
         node.disconnect()
         nodes.removeAll { $0.id == node.id }
+        arrayActualQuality = nil
+        qualityVerifiedParticipantIDs.removeAll()
+        arrayQualityStatus = "Array changed; actual quality must be re-verified."
         if selectedNodeID == node.id { selectedNodeID = nodes.first?.id }
         log("removed \(node.ip)")
     }
@@ -574,6 +707,9 @@ final class ArrayController: ObservableObject {
         stopMatch()
         if soak.isRecording { stopSoak(reason: "array disconnected") }
         for node in nodes { node.disconnect() }
+        arrayActualQuality = nil
+        qualityVerifiedParticipantIDs.removeAll()
+        arrayQualityStatus = "Disconnected; actual quality is not verified."
     }
 
     func streamAll() {
@@ -719,7 +855,7 @@ final class ArrayController: ObservableObject {
     /// this deliberately ignores APERTURE_CONTROL and never sends APERTURE.
     /// Every connected + streaming participant must have a trusted sphere lock.
     func startManualMatch() {
-        guard manualTask == nil, !loopRunning, !manualSessionActive else { return }
+        guard manualTask == nil, !loopRunning, !manualSessionActive, !qualityControlsLocked else { return }
         guard manualTargetMode != .custom || manualCustomTargetIRE != nil else {
             manualPhase = .failed
             manualStatus = "Custom target must be a valid Log3G10 IRE between 0 and 100."
@@ -730,6 +866,7 @@ final class ArrayController: ObservableObject {
         manualEndRequested = false
         manualEndWasFailure = false
         manualEndMessage = "Manual Assist aborted by operator."
+        manualExpectedQuality = nil
         manualTargetIRE = nil
         manualParticipantCount = 0
         manualMatchedCount = 0
@@ -751,6 +888,7 @@ final class ArrayController: ObservableObject {
 
         manualPhase = .preparing
         manualStatus = "Checking streams, sphere locks, and mirrored outputs…"
+        qualityControlsLocked = true
         manualTask = Task { await runManualMatchSession() }
     }
 
@@ -813,16 +951,29 @@ final class ArrayController: ObservableObject {
             await failManualMatch("Need at least two connected cameras for Manual Assist.")
             return
         }
-        let unstreamed = parts.filter { !$0.stream.isStreaming }
-        guard unstreamed.isEmpty else {
-            await failManualMatch("Start the livestream on every connected camera: \(unstreamed.map(\.ip).joined(separator: ", ")).")
+        guard await verifyUniformLivestreamQuality(parts, requested: arrayQuality,
+                                                   context: "Manual Assist preflight") else {
+            await failManualMatch("Livestream quality verification failed. Every participant must return the same actual quality before capture. \(arrayQualityStatus)")
             return
         }
-        let unlocked = parts.filter { $0.sphere.phase != .locked || $0.sphere.heroIRE == nil }
-        guard unlocked.isEmpty else {
-            await failManualMatch("Sphere lock required on every streaming camera: \(unlocked.map(\.ip).joined(separator: ", ")).")
+        guard let verifiedQuality = arrayActualQuality else {
+            await failManualMatch("Livestream quality proof disappeared after preflight.")
             return
         }
+        manualExpectedQuality = verifiedQuality
+        // Streams flap on a busy bench (auto-recover restarts, brief timeouts), so
+        // a single instantaneous snapshot of "is everyone streaming and locked?"
+        // would reject a fully-seeded array just because one camera was mid-restart
+        // at the exact moment the operator pressed Capture. Wait a bounded window
+        // for every connected camera to be stream-live AND holding a measurable
+        // sphere lock before giving up. Seeds already coast through detection
+        // misses, so the only real transient here is the livestream re-establishing.
+        if let notReady = await awaitManualReady(parts) {
+            if manualEndRequested { await closeManualMatch() }
+            else { await failManualMatch(notReady) }
+            return
+        }
+        guard !manualEndRequested else { await closeManualMatch(); return }
 
         manualParticipantIDs = Set(parts.map(\.id))
         for node in parts { node.fastAnalysis = true }   // human-in-the-loop fast path
@@ -908,16 +1059,21 @@ final class ArrayController: ObservableObject {
         }
         guard !manualEndRequested else { await closeManualMatch(); return }
 
-        let target: Double
+        let rawTarget: Double
         switch manualTargetMode {
         case .median:
-            target = median(Array(baselines.values)) ?? 0
+            rawTarget = median(Array(baselines.values)) ?? 0
         case .gray18:
             // 18% gray anchors at 33.3 IRE in Log3G10, 42.3 IRE in IPP2.
-            target = manualTransform.isLog3G10 ? Log3G10.grayAnchorIRE : Self.ipp2GrayAnchorIRE
+            rawTarget = manualTransform.isLog3G10 ? Log3G10.grayAnchorIRE : Self.ipp2GrayAnchorIRE
         case .custom:
-            target = manualCustomTargetIRE ?? 0
+            rawTarget = manualCustomTargetIRE ?? 0
         }
+        // Preserve the captured/calibrated target at full precision for all stop
+        // math. Manual operation does not require landing the displayed decimal:
+        // the UI rounds the label while the tolerance/hold logic remains centered
+        // on this exact value (Log3G10 18% gray = 33.333291 IRE).
+        let target = rawTarget
         if manualTransform.isLog3G10 {
             guard target > 0, Log3G10.linearize(target / 100.0) > 0 else {
                 await failManualMatch("Captured target is outside the usable Log3G10 range.")
@@ -944,7 +1100,7 @@ final class ArrayController: ObservableObject {
                 detail: "fixed target captured")
         }
         manualPhase = .trimming
-        manualStatus = String(format: "Target locked at %.1f IRE — select a camera and trim its lens.", target)
+        manualStatus = String(format: "Target locked at %.0f IRE — select a camera and trim its lens.", target)
         log(String(format: "manual match: START — %d cameras, fixed target %.2f IRE, tolerance ±%.3f stop, hold %.1fs",
                    parts.count, target, manualToleranceStops, manualHoldSeconds))
         soak.recordMatchEvent("manual_match_start",
@@ -964,7 +1120,13 @@ final class ArrayController: ObservableObject {
     private func captureManualBaselines(_ parts: [CameraNode]) async -> [UUID: Double]? {
         var samples: [UUID: [Double]] = [:]
         var lastSeen: [UUID: Date] = [:]
-        let deadline = Date().addingTimeInterval(1.5)
+        // Collect at least two fresh samples per camera. Exit as soon as every
+        // camera has enough (normally well under a second), but keep waiting up to
+        // a longer bound so one camera briefly mid-restart — the same bench
+        // stream-flap that used to block the capture entirely — doesn't fail the
+        // whole array. Only a camera that never recovers within the bound aborts.
+        let enough = { (id: UUID) in (samples[id]?.count ?? 0) >= 2 }
+        let deadline = Date().addingTimeInterval(Self.manualReadyGrace)
         while Date() < deadline, !manualEndRequested {
             for node in parts {
                 guard node.sphere.phase == .locked,
@@ -974,10 +1136,11 @@ final class ArrayController: ObservableObject {
                 samples[node.id, default: []].append(ire)
                 lastSeen[node.id] = measuredAt
             }
+            if parts.allSatisfy({ enough($0.id) }) { break }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         guard !manualEndRequested,
-              parts.allSatisfy({ (samples[$0.id]?.count ?? 0) >= 2 }) else { return nil }
+              parts.allSatisfy({ enough($0.id) }) else { return nil }
 
         var result: [UUID: Double] = [:]
         for node in parts {
@@ -993,9 +1156,45 @@ final class ArrayController: ObservableObject {
         guard let target = manualTargetIRE else { return }
         let now = Date()
 
+        // Catch a camera-side or restart read-back that diverges after
+        // preflight. The UI quality controls are already locked, but a mixed
+        // actual quality must also stop certification instead of being logged
+        // and silently measured.
+        guard let expected = manualExpectedQuality else {
+            manualEndWasFailure = true
+            manualEndMessage = "Measurement stopped: livestream quality proof was lost."
+            manualEndRequested = true
+            manualArrayStableSince = nil
+            log("manual match: quality invariant LOST — \(manualEndMessage)")
+            return
+        }
+        guard arrayActualQuality == expected else {
+            manualEndWasFailure = true
+            manualEndMessage =
+                "Measurement stopped: participant quality proof was invalidated; re-verify the array."
+            manualEndRequested = true
+            manualArrayStableSince = nil
+            log("manual match: quality invariant LOST — \(manualEndMessage)")
+            return
+        }
+        if let changed = parts.first(where: {
+            $0.status.livestreamQuality != expected
+        }) {
+            let actual = changed.status.livestreamQuality
+                .flatMap { RCP2.livestreamQualityLabels[$0] } ?? "NO READ-BACK"
+            manualEndWasFailure = true
+            manualEndMessage =
+                "Measurement stopped: \(manualIDKey(changed)) changed livestream quality to \(actual)."
+            manualEndRequested = true
+            manualArrayStableSince = nil
+            log("manual match: quality invariant LOST — \(manualEndMessage)")
+            return
+        }
+
         // Only the fullscreen-focused camera runs the ~14 Hz frozen fast path.
+        // Livestream quality remains identical across every participant; focus
+        // may change analysis cadence, never the camera's JPEG quality factor.
         for node in parts { node.focusedTrim = (node.id == fullScreenNodeID) }
-        applyFocusStreamQuality()
 
         for node in parts {
             let measurementFresh: Bool
@@ -1139,6 +1338,11 @@ final class ArrayController: ObservableObject {
             if now.timeIntervalSince(since) >= manualHoldSeconds {
                 if manualPhase != .complete {
                     manualPhase = .complete
+                    // Whole array is calibrated — drop out of the single-camera
+                    // fullscreen feed back to the multiview so the operator sees
+                    // every tile verified at once (and guided auto-advance, which
+                    // only runs while fullscreen, naturally stops).
+                    fullScreenNodeID = nil
                     manualStatus = "Array verified simultaneously — Finish & Restore when ready."
                     log("manual match: VERIFY PASS — every participant held the fixed target")
                     soak.recordMatchEvent("manual_match_verified",
@@ -1241,7 +1445,6 @@ final class ArrayController: ObservableObject {
             node.unfreezeTransformLock()
         }
         for node in nodes { node.focusedTrim = false }
-        applyFocusStreamQuality(restoreOnly: true)   // restore any lowered stream
 
         manualSavedTransforms.removeAll()
         manualChangedOutputs.removeAll()
@@ -1251,7 +1454,9 @@ final class ArrayController: ObservableObject {
         manualFocusDwellSince = nil
         manualEndRequested = false
         manualEndWasFailure = false
+        manualExpectedQuality = nil
         manualTask = nil
+        qualityControlsLocked = false
     }
 
     private func median(_ values: [Double]) -> Double? {
@@ -1342,8 +1547,9 @@ final class ArrayController: ObservableObject {
     }
 
     func startMatch() {
-        guard loopTask == nil, manualTask == nil, !manualSessionActive else { return }
+        guard loopTask == nil, manualTask == nil, !manualSessionActive, !qualityControlsLocked else { return }
         matchWorkflow = .electronic
+        qualityControlsLocked = true
         loopTask = Task { await runMatchLoop() }
     }
 
@@ -1456,11 +1662,23 @@ final class ArrayController: ObservableObject {
                                       detail: matchResultText)
             }
             loopTask = nil
+            qualityControlsLocked = false
         }
 
         guard parts.count >= 2 || (parts.count == 1 && referenceMode == .hero) else {
             loopState = .finished("need ≥2 participating cameras (connected + e-iris + streaming + sphere locked)")
             log("match loop: not enough participants")
+            return
+        }
+        guard await verifyUniformLivestreamQuality(parts, requested: arrayQuality,
+                                                   context: "Electronic Match preflight") else {
+            loopState = .finished("livestream quality mismatch: actual read-backs must be identical")
+            log("match loop: quality preflight BLOCKED — \(arrayQualityStatus)")
+            return
+        }
+        guard let expectedQuality = arrayActualQuality else {
+            loopState = .finished("livestream quality proof disappeared after preflight")
+            log("match loop: quality invariant LOST immediately after preflight")
             return
         }
         guard let transformMode = await transformPreflight(parts) else { return }
@@ -1481,6 +1699,24 @@ final class ArrayController: ObservableObject {
 
         for round in 1...Self.maxRounds {
             if Task.isCancelled { return }
+            guard arrayActualQuality == expectedQuality else {
+                loopState = .finished(
+                    "livestream quality proof was invalidated; re-verify the participants"
+                )
+                log("match loop: quality invariant LOST — \(arrayQualityStatus)")
+                return
+            }
+            if let changed = parts.first(where: {
+                $0.status.livestreamQuality != expectedQuality
+            }) {
+                let actual = changed.status.livestreamQuality
+                    .flatMap { RCP2.livestreamQualityLabels[$0] } ?? "NO READ-BACK"
+                loopState = .finished(
+                    "livestream quality changed on \(changed.displayName) to \(actual)"
+                )
+                log("match loop: quality invariant LOST — \(changed.displayName) actual \(actual)")
+                return
+            }
             finalRound = round
             loopState = .running(round: round)
             soak.recordMatchEvent("round", round: round)
@@ -1492,6 +1728,27 @@ final class ArrayController: ObservableObject {
             if !fresh {
                 loopState = .finished("stalled: sphere measurements stopped updating")
                 log("match loop: measurement stall — check streams / sphere locks")
+                return
+            }
+            // A stream restart can complete while the freshness wait is in
+            // flight. Re-check after it so no iris correction is ever planned
+            // from a frame whose actual JPEG quality has just diverged.
+            guard arrayActualQuality == expectedQuality else {
+                loopState = .finished(
+                    "livestream quality proof was invalidated during measurement freshness wait"
+                )
+                log("match loop: quality invariant LOST after freshness gate — \(arrayQualityStatus)")
+                return
+            }
+            if let changed = parts.first(where: {
+                $0.status.livestreamQuality != expectedQuality
+            }) {
+                let actual = changed.status.livestreamQuality
+                    .flatMap { RCP2.livestreamQualityLabels[$0] } ?? "NO READ-BACK"
+                loopState = .finished(
+                    "livestream quality changed on \(changed.displayName) to \(actual)"
+                )
+                log("match loop: quality invariant LOST after freshness gate — \(changed.displayName) actual \(actual)")
                 return
             }
             guard let ref = computeReference(parts) else {
@@ -1671,6 +1928,44 @@ final class ArrayController: ObservableObject {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
         return moved.allSatisfy { $0.status.apertureSettled }
+    }
+
+    /// Bounded readiness gate for Manual Assist capture. Instead of rejecting the
+    /// whole array on a single-frame snapshot, poll until every connected camera
+    /// is streaming and holding a measurable sphere lock, or the grace elapses.
+    /// Returns nil when the array is ready (or the operator aborted — the caller
+    /// re-checks `manualEndRequested`), otherwise an operator-facing message
+    /// naming the cameras and the reason each is still not ready. A coasting lock
+    /// counts as ready: the sphere is static and still measured at its ROI, and a
+    /// seeded lock re-reports `.locked` on the very next frame.
+    private func awaitManualReady(_ parts: [CameraNode]) async -> String? {
+        let deadline = Date().addingTimeInterval(Self.manualReadyGrace)
+        var announced = false
+        while !manualEndRequested {
+            let notReady = parts.filter {
+                !$0.stream.isStreaming
+                    || ($0.sphere.phase != .locked && $0.sphere.phase != .coasting)
+                    || $0.sphere.heroIRE == nil
+            }
+            if notReady.isEmpty { return nil }
+            if Date() >= deadline {
+                let detail = notReady.map { node -> String in
+                    let why: String
+                    if !node.stream.isStreaming { why = "no stream" }
+                    else if node.sphere.heroIRE == nil { why = "no sphere measurement" }
+                    else { why = "sphere lock lost" }
+                    return "\(node.ip) (\(why))"
+                }.joined(separator: ", ")
+                return "Cameras not ready for capture after \(Int(Self.manualReadyGrace))s: \(detail). Streams or sphere locks are still settling — let them recover, then try again."
+            }
+            if !announced {
+                announced = true
+                manualStatus = "Waiting for streams and sphere locks to settle…"
+                log("manual match: waiting up to \(Int(Self.manualReadyGrace))s for \(parts.count) camera(s) to be stream-live and sphere-locked before capture")
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return nil
     }
 
     private func waitFreshMeasurements(_ parts: [CameraNode], after epoch: Date) async -> Bool {

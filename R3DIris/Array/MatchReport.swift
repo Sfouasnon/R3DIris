@@ -167,7 +167,7 @@ struct ReportSheetView: View {
                     .foregroundStyle(Theme.ink3)
             }
             Spacer()
-            summaryStat("TARGET", String(format: "%.1f IRE", model.targetIRE), Theme.ink)
+            summaryStat("TARGET", String(format: "%.0f IRE", model.targetIRE), Theme.ink)
             summaryStat("TOLERANCE", String(format: "±%.2f st", model.toleranceStops), Theme.ink2)
             summaryStat("ARRAY SPREAD",
                         model.spreadStops.map { String(format: "%.3f st", $0) } ?? "—",
@@ -278,7 +278,7 @@ struct ReportTileView: View {
             Text(String(format: "Δ %+.1f IRE", cam.deltaIRE ?? 0))
                 .font(Theme.mono(11))
                 .foregroundStyle(Theme.ink2)
-            Text("→ \(String(format: "%.1f", cam.targetIRE))")
+            Text("→ \(String(format: "%.0f", cam.targetIRE))")
                 .font(Theme.mono(11))
                 .foregroundStyle(Theme.ink3)
         }
