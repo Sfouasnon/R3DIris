@@ -46,6 +46,11 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
     /// Decode only the newest buffered frame per callback (drop stale ones) to
     /// keep display latency from creeping. Set by ArrayController.
     var dropToLatestFrame = true
+    /// Local decode throttle. The HTTP reader still parses and timestamps every
+    /// complete JPEG so transport health remains accurate, but background array
+    /// cameras do not need to rasterize every 1920×1080 frame while one camera is
+    /// receiving the operator's attention. Zero preserves the full-rate path.
+    var minimumDecodeInterval: TimeInterval = 0
 
     private var session: URLSession?
     private var task: URLSessionDataTask?
@@ -55,9 +60,11 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
     private var firstFrameLogged = false
     private var frameTimes: [Date] = []
     private var byteWindow: [(Date, Int)] = []
+    private var lastDecodeAt = Date.distantPast
+    private var logHandshakeDetails = true
 
-    func start(ip: String) {
-        stop()
+    func start(ip: String, logHandshake: Bool = true) {
+        stop(log: false)
         generation &+= 1
         guard let url = URL(string: "http://\(ip):\(RCP2.livestreamPort)/") else {
             lastError = "bad URL"
@@ -75,22 +82,26 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
         firstFrameLogged = false
         frameTimes.removeAll()
         byteWindow.removeAll()
+        lastDecodeAt = .distantPast
+        logHandshakeDetails = logHandshake
         stats = Stats()
         lastError = ""
         isStreaming = true
-        onLog?("livestream: GET \(url.absoluteString)")
+        if logHandshake {
+            onLog?("livestream: GET \(url.absoluteString)")
+        }
         let task = session.dataTask(with: url)
         self.task = task
         task.resume()
     }
 
-    func stop() {
+    func stop(log: Bool = true) {
         generation &+= 1
         task?.cancel()
         task = nil
         session?.invalidateAndCancel()
         session = nil
-        if isStreaming {
+        if log, isStreaming {
             onLog?("livestream: stopped (\(stats.frames) frames)")
         }
         isStreaming = false
@@ -110,7 +121,7 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
         }
 
         // Bench: log the first part's preamble (boundary + part headers) once.
-        if !preambleLogged, let soi = firstSOI(in: buffer) {
+        if logHandshakeDetails, !preambleLogged, let soi = firstSOI(in: buffer) {
             preambleLogged = true
             let preamble = buffer.prefix(min(soi, 512))
             let text = String(data: preamble, encoding: .ascii)?
@@ -122,7 +133,8 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
         // Freshest-frame: when frames have backed up, decode only the newest and
         // drop the stale ones undecoded — keeps display latency from creeping and
         // cuts main-thread decode load. Every arrival is still counted for the fps
-        // stat and the stall watchdog. Off ⇒ decode every frame (original behavior).
+        // stat and the stall watchdog. With freshest-frame dropping off, a zero
+        // decode interval preserves the original decode-every-frame behavior.
         var latest: Data? = nil
         while let jpeg = extractNextJPEG() {
             // URLSession timestamps bytes by delegate chunk before the MainActor
@@ -130,13 +142,20 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
             // share that chunk-arrival timestamp.
             onJPEG?(jpeg, receivedAt)
             recordArrival(at: receivedAt)
-            if dropToLatestFrame {
+            // A decode throttle necessarily keeps only the newest payload even
+            // when the operator disabled general freshest-frame dropping.
+            if dropToLatestFrame || minimumDecodeInterval > 0 {
                 latest = jpeg
             } else {
                 decode(jpeg)
             }
         }
-        if let latest { decode(latest) }
+        if let latest,
+           minimumDecodeInterval <= 0
+            || now.timeIntervalSince(lastDecodeAt) >= minimumDecodeInterval {
+            lastDecodeAt = now
+            decode(latest)
+        }
         // Safety: a stream that never yields SOI must not grow unbounded.
         if buffer.count > 32 * 1024 * 1024 {
             onLog?("livestream: 32MB buffered without a complete JPEG — resetting buffer")
@@ -187,7 +206,7 @@ final class MJPEGStreamReader: NSObject, ObservableObject {
         frame = img
         stats.width = img.width
         stats.height = img.height
-        if !firstFrameLogged {
+        if logHandshakeDetails, !firstFrameLogged {
             firstFrameLogged = true
             onLog?("livestream: first frame \(img.width)×\(img.height), \(jpeg.count) bytes")
         }
@@ -204,7 +223,7 @@ extension MJPEGStreamReader: URLSessionDataDelegate {
         completionHandler(.allow)
         Task { @MainActor in
             guard self.session === session, self.task === dataTask else { return }
-            guard !self.headerLogged else { return }
+            guard self.logHandshakeDetails, !self.headerLogged else { return }
             self.headerLogged = true
             if let http = response as? HTTPURLResponse {
                 let headers = http.allHeaderFields

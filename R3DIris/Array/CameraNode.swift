@@ -10,15 +10,34 @@ import CoreGraphics
 
 @MainActor
 final class CameraNode: ObservableObject, Identifiable {
+    enum StreamRole: String, Sendable {
+        /// Normal multiview / sphere-solving behavior.
+        case normal
+        /// Local HTTP reader intentionally closed; RCP and camera settings stay up.
+        case parked
+        /// The next Manual Assist camera, kept ready for a quick handoff.
+        case warm
+        /// The fullscreen camera currently being adjusted by the operator.
+        case focused
+    }
+
     nonisolated let id = UUID()
     let ip: String
 
     @Published private(set) var status = CameraStatus()
     @Published private(set) var sphere = SphereState()
     @Published private(set) var waveform: WaveformGrid? = nil
-    /// Frozen-stream watchdog: the livestream has stopped changing while
-    /// streaming (the silent mid-soak degradation, 2026-07-20). UI-visible.
+    /// Legacy UI signal retained for compatibility. Transport recovery is based
+    /// exclusively on MJPEG arrival timestamps; identical image content is valid
+    /// for a locked, stationary sphere and never marks the stream stale.
     @Published private(set) var streamStale = false
+    /// Local Manual Assist stream scheduling. Parked closes only this Mac's HTTP
+    /// reader; it never disables the camera encoder, changes quality, or touches
+    /// the RCP session.
+    @Published private(set) var streamRole: StreamRole = .normal
+    /// True from a local HTTP wake/reopen until three fresh native measurements
+    /// arrive. Fullscreen guidance remains paused for that entire interval.
+    @Published private(set) var streamRecovering = false
     /// Operator is placing/sizing a sphere mask (click-to-seed): a candidate
     /// ROI shown with a resize slider and center sample, not yet locked or
     /// broadcast. nil once approved or cancelled.
@@ -46,11 +65,6 @@ final class CameraNode: ObservableObject, Identifiable {
     /// flattens the sphere shading and collapses ire_spread (soak 2026-07-20).
     var desiredQuality = 4
 
-    // Frozen-stream watchdog bookkeeping.
-    static let freezeGrace: TimeInterval = 2.5
-    private var lastFingerprint: UInt64 = 0
-    private var frozenSince: Date?
-
     /// Analysis cadence — ~3 Hz keeps 12–40 nodes cheap; the auto loop's
     /// debounce dominates its responsiveness anyway (handoff §8).
     /// Manual trimming is different: a human is inside the feedback loop, so
@@ -64,12 +78,6 @@ final class CameraNode: ObservableObject, Identifiable {
     /// directly cutting the feedback latency that forces slow iris moves.
     static let frozenAnalysisInterval: TimeInterval = 0.07
 
-    /// Set by ArrayController for Manual Assist participants / the
-    /// full-screen camera; reverts when the session or fullscreen ends.
-    var fastAnalysis = false
-    /// Set true by ArrayController on the single camera currently being trimmed
-    /// (fullscreen focus). Only meaningful while its mask is frozen.
-    var focusedTrim = false
     /// When set, the auto-solve path logs a throttled per-frame detector
     /// diagnostic (Hough candidate count + support + the gate ladder) so the
     /// Hough-vs-gate question can be answered from the shared log.
@@ -78,12 +86,32 @@ final class CameraNode: ObservableObject, Identifiable {
     private var lastNativeProbeFailureLogAt = Date.distantPast
 
     private var currentAnalysisInterval: TimeInterval {
-        if focusedTrim && tracker.state.seeded { return Self.frozenAnalysisInterval }
-        return fastAnalysis ? Self.fastAnalysisInterval : Self.analysisInterval
+        switch streamRole {
+        case .focused:
+            return tracker.state.seeded ? Self.frozenAnalysisInterval : Self.fastAnalysisInterval
+        case .warm:
+            return Self.fastAnalysisInterval
+        case .normal:
+            return Self.analysisInterval
+        case .parked:
+            return .infinity
+        }
     }
 
     private var analyzing = false
     private var lastAnalysis = Date.distantPast
+    private var streamOperationTask: Task<Void, Never>?
+    private var streamIntentGeneration: UInt64 = 0
+    /// Set only after an actual LIVESTREAM_QUALITY read-back. Local HTTP
+    /// recovery is never allowed to bypass that initial measurement invariant.
+    private var streamSettingsVerified = false
+    private var recoveryStartedAt: Date?
+    private var recoveryFreshMeasurements = 0
+    private var recoveryStreamGeneration: UInt64?
+    /// Planned scheduler wakes are intentionally quiet. If a wake turns into a
+    /// real retry, logging is promoted for that recovery generation.
+    private var recoveryLogsEnabled = false
+    private var lastLocalReaderOpenAt = Date.distantPast
 
     var onLog: ((String) -> Void)?
     var onStatusChange: ((CameraNode) -> Void)?
@@ -99,7 +127,7 @@ final class CameraNode: ObservableObject, Identifiable {
             self.onLog?("[\(self.ip)] \(line)")
         }
         stream.onFrame = { [weak self] img in
-            self?.analyzeThrottled(img)
+            self?.streamFrameDecoded(img)
         }
     }
 
@@ -128,6 +156,9 @@ final class CameraNode: ObservableObject, Identifiable {
     }
 
     func disconnect() {
+        streamIntentGeneration &+= 1
+        streamOperationTask?.cancel()
+        streamOperationTask = nil
         stream.stop()
         if let cam = camera {
             camera = nil
@@ -141,9 +172,15 @@ final class CameraNode: ObservableObject, Identifiable {
         seedSignature = nil
         pendingSeed = nil
         streamStale = false
-        frozenSince = nil
-        lastFingerprint = 0
         streamingDesired = false
+        streamSettingsVerified = false
+        streamRole = .normal
+        stream.minimumDecodeInterval = 0
+        streamRecovering = false
+        recoveryStartedAt = nil
+        recoveryFreshMeasurements = 0
+        recoveryStreamGeneration = nil
+        recoveryLogsEnabled = false
         onStatusChange?(self)
     }
 
@@ -164,31 +201,196 @@ final class CameraNode: ObservableObject, Identifiable {
     /// Enable LIVESTREAM over the WS, then open :9090.
     func startStream() {
         guard let cam = camera else { return }
+
+        // A camera whose encoder was already enabled has only lost or parked its
+        // local HTTP reader. Reopening it must not churn LIVESTREAM_ENABLE or
+        // LIVESTREAM_QUALITY over RCP.
+        if streamingDesired, streamSettingsVerified {
+            let wasParked = streamRole == .parked
+            setStreamRole(.normal)
+            if !wasParked, !stream.isStreaming {
+                reopenLocalStream(reason: "operator wake", attempt: 1)
+            }
+            return
+        }
+
         streamingDesired = true
+        streamSettingsVerified = false
+        setDecodePolicy(for: .normal)
+        streamIntentGeneration &+= 1
+        let intent = streamIntentGeneration
+        let requestedQuality = desiredQuality
+        streamOperationTask?.cancel()
         lastStreamStartAt = Date()
-        Task {
-            _ = await cam.setLivestream(enabled: true)
+        resetContentHealth()
+        streamOperationTask = Task { [weak self] in
+            guard let self, !Task.isCancelled,
+                  self.streamingDesired, self.streamIntentGeneration == intent else { return }
+            defer {
+                if self.streamIntentGeneration == intent {
+                    self.streamOperationTask = nil
+                }
+            }
+            let enabled = await cam.setLivestream(enabled: true)
+            guard !Task.isCancelled, self.streamingDesired,
+                  self.streamIntentGeneration == intent else { return }
+            guard enabled else {
+                self.onLog?("[\(self.ip)] stream: NOT OPENED — LIVESTREAM_ENABLE command failed")
+                return
+            }
             // Q100 (or the array's chosen quality), read-back verified — the
             // camera never pushes LIVESTREAM_QUALITY, so this is the only proof
             // it actually took (soak finding 2026-07-20).
-            let quality = await cam.setLivestreamQuality(desiredQuality)
+            let quality = await cam.setLivestreamQuality(requestedQuality)
+            guard !Task.isCancelled, self.streamingDesired,
+                  self.streamIntentGeneration == intent else { return }
             guard let actual = quality.actual else {
-                onLog?("[\(ip)] stream: NOT OPENED — LIVESTREAM_QUALITY has no actual read-back")
+                self.onLog?("[\(self.ip)] stream: NOT OPENED — LIVESTREAM_QUALITY has no actual read-back")
                 return
             }
-            if actual != desiredQuality {
-                onLog?("[\(ip)] stream: requested \(RCP2.livestreamQualityLabels[desiredQuality] ?? "\(desiredQuality)"), camera actual \(RCP2.livestreamQualityLabels[actual] ?? "\(actual)"); array measurement remains blocked until participant read-backs agree")
+            self.streamSettingsVerified = true
+            if actual != requestedQuality {
+                self.onLog?("[\(self.ip)] stream: requested \(RCP2.livestreamQualityLabels[requestedQuality] ?? "\(requestedQuality)"), camera actual \(RCP2.livestreamQualityLabels[actual] ?? "\(actual)"); array measurement remains blocked until participant read-backs agree")
             }
             try? await Task.sleep(nanoseconds: 700_000_000)
-            stream.start(ip: ip)
+            guard !Task.isCancelled, self.streamingDesired,
+                  self.streamIntentGeneration == intent, self.streamRole != .parked else { return }
+            self.stream.start(ip: self.ip)
         }
     }
 
     func stopStream() {
+        streamIntentGeneration &+= 1
+        streamOperationTask?.cancel()
+        streamOperationTask = nil
         streamingDesired = false
+        streamSettingsVerified = false
+        streamRole = .normal
+        stream.minimumDecodeInterval = 0
+        streamRecovering = false
+        recoveryStartedAt = nil
+        recoveryFreshMeasurements = 0
+        recoveryStreamGeneration = nil
+        recoveryLogsEnabled = false
+        resetContentHealth()
         stream.stop()
         guard let cam = camera else { return }
-        Task { _ = await cam.setLivestream(enabled: false) }
+        let intent = streamIntentGeneration
+        streamOperationTask = Task { [weak self] in
+            guard let self, !Task.isCancelled,
+                  !self.streamingDesired, self.streamIntentGeneration == intent else { return }
+            defer {
+                if self.streamIntentGeneration == intent {
+                    self.streamOperationTask = nil
+                }
+            }
+            _ = await cam.setLivestream(enabled: false)
+        }
+    }
+
+    /// Manual Assist scheduler entry point. Moving to `.parked` closes only the
+    /// local HTTP reader; the RCP session, camera encoder enable, actual quality,
+    /// frozen ROI, and last decoded frame remain untouched. Leaving `.parked`
+    /// performs an HTTP-only wake and therefore cannot churn camera settings.
+    func setStreamRole(_ role: StreamRole) {
+        guard streamRole != role else { return }
+        let previous = streamRole
+        setDecodePolicy(for: role)
+
+        if role == .parked {
+            streamRecovering = false
+            recoveryStartedAt = nil
+            recoveryFreshMeasurements = 0
+            recoveryStreamGeneration = nil
+            recoveryLogsEnabled = false
+            resetContentHealth()
+            // Always advance the reader generation so a decode already in
+            // flight cannot publish after this camera has been parked.
+            stream.stop(log: false)
+            return
+        }
+
+        guard previous == .parked, streamingDesired else { return }
+        reopenLocalStream(
+            reason: "\(role.rawValue) wake",
+            attempt: 1,
+            logTransitions: false
+        )
+    }
+
+    /// HTTP-only recovery. This never sends LIVESTREAM_ENABLE and never reads or
+    /// writes LIVESTREAM_QUALITY. ArrayController owns retry timing so attempts
+    /// cannot fan out on every 20 Hz guidance tick.
+    func reopenLocalStream(
+        reason: String,
+        attempt: Int,
+        logTransitions: Bool = true
+    ) {
+        guard streamingDesired, streamSettingsVerified,
+              streamRole != .parked else { return }
+        // Let an initial enable/quality transaction finish rather than opening
+        // an unverified feed underneath it. Scheduled retries will return here
+        // after that operation completes.
+        guard streamOperationTask == nil else { return }
+        // A role wake and the controller watchdog can notice the same missing
+        // feed on adjacent ticks. Bound restarts locally as a final defense
+        // against reopening the socket twice before it can deliver a first JPEG.
+        if streamRecovering {
+            let minimumInterval: TimeInterval
+            switch streamRole {
+            case .focused: minimumInterval = 0.75
+            case .warm: minimumInterval = 2
+            case .normal: minimumInterval = 4
+            case .parked: return
+            }
+            guard Date().timeIntervalSince(lastLocalReaderOpenAt) >= minimumInterval else { return }
+        }
+        let firstAttempt = !streamRecovering
+        if firstAttempt {
+            streamRecovering = true
+            recoveryStartedAt = Date()
+            recoveryFreshMeasurements = 0
+            recoveryLogsEnabled = logTransitions
+            if logTransitions {
+                onLog?("[\(ip)] stream: recovering — \(reason)")
+            }
+        } else if logTransitions {
+            if recoveryLogsEnabled {
+                if attempt > 1 {
+                    onLog?("[\(ip)] stream: recovery retry \(attempt)")
+                }
+            } else {
+                recoveryLogsEnabled = true
+                onLog?("[\(ip)] stream: planned wake stalled — recovery retry \(attempt)")
+            }
+        }
+        lastStreamStartAt = Date()
+        resetContentHealth()
+        stream.start(ip: ip, logHandshake: false)
+        lastLocalReaderOpenAt = Date()
+        // A retry is a new HTTP generation: prior successes cannot be carried
+        // across it, and an analysis finishing from the replaced reader cannot
+        // certify recovery.
+        recoveryFreshMeasurements = 0
+        recoveryStreamGeneration = stream.generation
+    }
+
+    private func setDecodePolicy(for role: StreamRole) {
+        streamRole = role
+        switch role {
+        case .focused:
+            stream.minimumDecodeInterval = 0
+        case .warm:
+            stream.minimumDecodeInterval = 0.12
+        case .normal:
+            stream.minimumDecodeInterval = 0
+        case .parked:
+            stream.minimumDecodeInterval = 1
+        }
+    }
+
+    private func resetContentHealth() {
+        streamStale = false
     }
 
     // MARK: - Capability gate (handoff §7 e-iris detection, APERTURE_NOTES)
@@ -228,7 +430,11 @@ final class CameraNode: ObservableObject, Identifiable {
 
     // MARK: - Analysis
 
-    private func analyzeThrottled(_ img: CGImage) {
+    private func streamFrameDecoded(_ img: CGImage) {
+        analyzeThrottled(img, streamGeneration: stream.generation)
+    }
+
+    private func analyzeThrottled(_ img: CGImage, streamGeneration: UInt64) {
         guard !analyzing, Date().timeIntervalSince(lastAnalysis) >= currentAnalysisInterval else { return }
         analyzing = true
         lastAnalysis = Date()
@@ -240,7 +446,6 @@ final class CameraNode: ObservableObject, Identifiable {
         Task.detached(priority: .utility) { [weak self] in
             var detection: SphereDetection?
             var grid: WaveformGrid?
-            var fingerprint: UInt64 = 0
             if let buf = PixelBuffer.from(handle.image) {
                 let prior = trackerSnapshot.prior(forBufferWidth: buf.width, height: buf.height)
                 if trackerSnapshot.state.seeded, let prior {
@@ -281,11 +486,9 @@ final class CameraNode: ObservableObject, Identifiable {
                     detection = det
                 }
                 grid = WaveformGrid.compute(from: buf)
-                fingerprint = CameraNode.frameFingerprint(buf)
             }
             let det = detection
             let g = grid
-            let fp = fingerprint
             let elapsedMS = Double(DispatchTime.now().uptimeNanoseconds - analysisStarted) / 1_000_000
             // `self` here is the weak-captured VAR from the detached closure;
             // rebinding to an immutable local before the @Sendable MainActor
@@ -293,31 +496,45 @@ final class CameraNode: ObservableObject, Identifiable {
             // without changing semantics.
             let node = self
             await MainActor.run {
-                node?.applyAnalysis(detection: det, grid: g, analysisMS: elapsedMS, fingerprint: fp)
+                node?.applyAnalysis(
+                    detection: det,
+                    grid: g,
+                    analysisMS: elapsedMS,
+                    streamGeneration: streamGeneration
+                )
             }
         }
     }
 
-    /// Cheap frozen-frame fingerprint: FNV-1a over a strided luma sample.
-    /// Two consecutive identical values while streaming ⇒ the feed has stalled.
-    nonisolated private static func frameFingerprint(_ buf: PixelBuffer) -> UInt64 {
-        var acc: UInt64 = 1469598103934665603   // FNV offset basis
-        let step = max(1, buf.luma.count / 512)
-        var i = 0
-        while i < buf.luma.count {
-            acc = (acc ^ UInt64(buf.luma[i] * 255)) &* 1099511628211
-            i += step
-        }
-        return acc
-    }
-
     private func applyAnalysis(detection: SphereDetection?, grid: WaveformGrid?,
-                               analysisMS: Double, fingerprint: UInt64) {
+                               analysisMS: Double, streamGeneration: UInt64) {
         analyzing = false
-        updateStreamHealth(fingerprint: fingerprint)
+        // stop/start invalidates any detached analysis still in flight. Never
+        // publish its tracker state or count it toward recovery.
+        guard streamGeneration == stream.generation else { return }
         if let detection {
             tracker.update(with: detection)
             sphere = tracker.state
+            if streamRecovering, recoveryStreamGeneration == streamGeneration {
+                if detection.heroIRE != nil {
+                    recoveryFreshMeasurements += 1
+                    if recoveryFreshMeasurements >= 3 {
+                        let elapsed = recoveryStartedAt.map {
+                            Date().timeIntervalSince($0)
+                        } ?? 0
+                        streamRecovering = false
+                        recoveryStartedAt = nil
+                        recoveryFreshMeasurements = 0
+                        recoveryStreamGeneration = nil
+                        if recoveryLogsEnabled {
+                            onLog?("[\(ip)] stream: recovered in \(String(format: "%.1f", elapsed))s — 3 fresh native measurements")
+                        }
+                        recoveryLogsEnabled = false
+                    }
+                } else {
+                    recoveryFreshMeasurements = 0
+                }
+            }
             if detection.roi != nil, detection.heroIRE == nil {
                 let now = Date()
                 if now.timeIntervalSince(lastNativeProbeFailureLogAt) >= 3.0 {
@@ -489,26 +706,6 @@ final class CameraNode: ObservableObject, Identifiable {
         sphere = tracker.state
     }
 
-    private func updateStreamHealth(fingerprint: UInt64) {
-        guard stream.isStreaming else {
-            frozenSince = nil; lastFingerprint = 0
-            if streamStale { streamStale = false }
-            return
-        }
-        if fingerprint != 0 && fingerprint == lastFingerprint {
-            if frozenSince == nil { frozenSince = Date() }
-            if let since = frozenSince,
-               Date().timeIntervalSince(since) >= Self.freezeGrace, !streamStale {
-                streamStale = true
-                onLog?("[\(ip)] stream: FROZEN — frames unchanged for ≥\(Int(Self.freezeGrace))s (check the feed / mirror source)")
-            }
-        } else {
-            if streamStale { onLog?("[\(ip)] stream: recovered") }
-            frozenSince = nil
-            streamStale = false
-        }
-        lastFingerprint = fingerprint
-    }
 }
 
 /// A sphere mask the operator is placing/sizing before approving it.
@@ -557,6 +754,7 @@ struct ManualMatchInfo: Sendable, Equatable {
         case close = "CLOSE"
         case hold = "HOLD"
         case matched = "MATCHED"
+        case recovering = "HOLD - RECOVERING"
         case unavailable = "NO SIGNAL"
     }
 

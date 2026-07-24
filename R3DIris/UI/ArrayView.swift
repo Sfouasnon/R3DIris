@@ -259,6 +259,22 @@ struct CameraTile: View {
                     ManualCameraHUD(info: node.manualMatch, selected: selected)
                         .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSm))
                 }
+                if node.streamRole == .parked, node.streamingDesired {
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Text("PARKED • LAST FRAME")
+                                .font(Theme.mono(8.5, weight: .bold))
+                                .foregroundStyle(Theme.ink2)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 4)
+                                .background(Capsule().fill(Color.black.opacity(0.78)))
+                        }
+                        Spacer()
+                    }
+                    .padding(7)
+                    .allowsHitTesting(false)
+                }
             }
 
             // Identity row
@@ -340,10 +356,18 @@ struct CameraTile: View {
             .stroke(selected ? Theme.accent : Theme.line, lineWidth: selected ? 2 : 1))
         .contentShape(Rectangle())
         .gesture(TapGesture(count: 2).onEnded {
-            array.selectedNodeID = node.id
-            array.fullScreenNodeID = node.id
+            if array.manualSessionActive, array.isManualParticipant(node) {
+                array.selectManualCamera(node)
+            } else if !array.manualSessionActive {
+                array.selectedNodeID = node.id
+                array.fullScreenNodeID = node.id
+            }
         })
-        .simultaneousGesture(TapGesture().onEnded { array.selectedNodeID = node.id })
+        .simultaneousGesture(TapGesture().onEnded {
+            if !array.manualSessionActive || array.fullScreenNodeID == node.id {
+                array.selectedNodeID = node.id
+            }
+        })
         .help("Click: select · double-click: full screen")
     }
 
@@ -473,6 +497,7 @@ struct CameraTile: View {
         case .matched: return Theme.goodBG
         case .hold: return Theme.accentBG
         case .open, .close: return Theme.warnBG
+        case .recovering: return Theme.warnBG
         case .unavailable: return Theme.dangerBG
         case .acquiring, .idle: return Theme.idleBG
         }
@@ -483,6 +508,7 @@ struct CameraTile: View {
         case .matched: return Theme.good
         case .hold: return Theme.accent
         case .open, .close: return Theme.warn
+        case .recovering: return Theme.warn
         case .unavailable: return Theme.danger
         case .acquiring, .idle: return Theme.idle
         }
@@ -539,6 +565,7 @@ enum ManualCueStyle {
         case .close: return "minus.circle"
         case .hold: return "target"
         case .matched: return "checkmark.circle.fill"
+        case .recovering: return "arrow.clockwise.circle.fill"
         case .unavailable: return "exclamationmark.triangle.fill"
         case .acquiring: return "viewfinder"
         case .idle: return "circle.dashed"
@@ -550,8 +577,37 @@ enum ManualCueStyle {
         case .matched: return Theme.good
         case .hold: return Theme.accent
         case .open, .close: return Theme.warn
+        case .recovering: return Theme.warn
         case .unavailable: return Theme.danger
         case .acquiring, .idle: return Theme.idle
+        }
+    }
+}
+
+/// UI-only progress cadence for a focused camera whose MJPEG reader is being
+/// recovered. The dots animate locally; no controller timer or repeated log
+/// message is needed to make recovery feel alive to the operator.
+struct ManualRecoveryText: View {
+    let size: CGFloat
+    let label: String
+    @State private var startedAt = Date()
+
+    init(size: CGFloat, label: String = "HOLD - RECOVERING") {
+        self.size = size
+        self.label = label
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: startedAt, by: 0.45)) { context in
+            let elapsed = max(0, context.date.timeIntervalSince(startedAt))
+            let tick = Int(elapsed / 0.45)
+            let dots = tick % 3 + 1
+            Text(label + String(repeating: ".", count: dots))
+                .font(.system(size: size, weight: .heavy, design: .rounded))
+                .tracking(size >= 24 ? 3.0 : 1.4)
+                .foregroundStyle(Theme.warn)
+                .shadow(color: .black.opacity(0.85), radius: 4)
+                .accessibilityLabel(label)
         }
     }
 }
@@ -763,6 +819,20 @@ struct FullscreenCameraView: View {
         array.manualSessionActive && array.isManualParticipant(node)
     }
 
+    private var manualRecovering: Bool {
+        manualActive
+            && array.manualPhase == .trimming
+            && (node.manualMatch.phase == .recovering || node.streamRecovering)
+    }
+
+    private var manualWaking: Bool {
+        manualActive && array.manualPhase == .preparing && node.streamRecovering
+    }
+
+    private var manualPaused: Bool {
+        manualRecovering || manualWaking
+    }
+
     var body: some View {
         ZStack {
             Color.black
@@ -770,14 +840,16 @@ struct FullscreenCameraView: View {
                 Image(decorative: frame, scale: 1.0)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
+                    .opacity(manualPaused ? 0.22 : 1)
                     .overlay {
                         // Manual trimming: the dial ring replaces the plain
                         // lock circle so the sphere stays fully visible.
-                        if manualActive {
+                        if manualActive, array.manualPhase == .trimming,
+                           !manualPaused {
                             IrisDialOverlay(sphere: node.sphere, info: node.manualMatch)
-                        } else if let seed = node.pendingSeed {
+                        } else if !manualPaused, let seed = node.pendingSeed {
                             PendingSeedOverlay(seed: seed)
-                        } else {
+                        } else if !manualPaused {
                             SphereOverlay(sphere: node.sphere)
                         }
                     }
@@ -810,8 +882,25 @@ struct FullscreenCameraView: View {
                     .foregroundStyle(Theme.ink3)
             }
 
-            if manualActive {
+            if manualActive && array.manualPhase == .trimming && !manualPaused {
                 BigIREReadouts(info: node.manualMatch)
+            }
+
+            if manualPaused {
+                ZStack {
+                    Color.black.opacity(0.28)
+                    ManualRecoveryText(
+                        size: 32,
+                        label: manualWaking ? "WAKING STREAM" : "HOLD - RECOVERING"
+                    )
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 16)
+                        .background(RoundedRectangle(cornerRadius: Theme.radius)
+                            .fill(Color.black.opacity(0.76)))
+                        .overlay(RoundedRectangle(cornerRadius: Theme.radius)
+                            .stroke(Theme.warn.opacity(0.72), lineWidth: 1.5))
+                }
+                .allowsHitTesting(false)
             }
 
             VStack {
@@ -827,25 +916,51 @@ struct FullscreenCameraView: View {
                     Text("T \(RCP2.stopLabel(node.status.apertureCur))")
                         .font(Theme.mono(13, weight: .semibold))
                         .foregroundStyle(Theme.ink2)
-                    if let ire = node.sphere.heroIRE {
+                    if !manualPaused, let ire = node.sphere.heroIRE {
                         Text(String(format: "%.1f IRE", ire))
                             .font(Theme.mono(13, weight: .semibold))
                             .foregroundStyle(Theme.accent)
                     }
                     Spacer()
-                    Button { array.fullscreenStep(-1) } label: {
-                        Image(systemName: "chevron.left").font(.system(size: 12, weight: .bold))
-                    }
-                    .buttonStyle(DarkButtonStyle())
-                    .help("Previous camera")
-                    Button { array.fullscreenStep(1) } label: {
-                        HStack(spacing: 4) {
-                            Text("Next Camera").font(.system(size: 12, weight: .semibold))
-                            Image(systemName: "chevron.right").font(.system(size: 12, weight: .bold))
+                    if !manualActive || array.manualPhase == .trimming {
+                        if manualActive && array.manualAdvanceMode == .operatorProceed {
+                            Button {
+                                array.proceedManualMatch()
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Text(array.manualProceedTitle(from: node))
+                                        .font(.system(size: 12, weight: .bold))
+                                    Image(systemName: "arrow.right.circle.fill")
+                                        .font(.system(size: 13, weight: .bold))
+                                }
+                            }
+                            .buttonStyle(DarkButtonStyle(prominent: true))
+                            .disabled(manualPaused || !array.canProceedManualMatch(from: node))
+                            .help("Available after this camera holds inside the match band for the full certification time.")
+                        } else {
+                            Button { array.fullscreenStep(-1) } label: {
+                                Image(systemName: "chevron.left").font(.system(size: 12, weight: .bold))
+                            }
+                            .buttonStyle(DarkButtonStyle())
+                            .help("Previous camera")
+                            Button { array.fullscreenStep(1) } label: {
+                                HStack(spacing: 4) {
+                                    Text("Next Camera").font(.system(size: 12, weight: .semibold))
+                                    Image(systemName: "chevron.right").font(.system(size: 12, weight: .bold))
+                                }
+                            }
+                            .buttonStyle(DarkButtonStyle(prominent: true))
+                            .help("Jump to the next camera (ID order) without minimizing")
                         }
                     }
-                    .buttonStyle(DarkButtonStyle(prominent: true))
-                    .help("Jump to the next camera (ID order) without minimizing")
+                    if manualActive,
+                       (array.manualPhase == .preparing
+                        || array.manualPhase == .trimming) {
+                        Button("Abort & Restore") {
+                            array.abortManualMatch()
+                        }
+                        .buttonStyle(DarkButtonStyle(destructive: true))
+                    }
                     Button {
                         array.fullScreenNodeID = nil
                     } label: {
@@ -853,6 +968,12 @@ struct FullscreenCameraView: View {
                             .font(.system(size: 12, weight: .bold))
                     }
                     .buttonStyle(DarkButtonStyle())
+                    .disabled(
+                        manualActive
+                            && (array.manualPhase == .preparing
+                                || (array.manualPhase == .trimming
+                                    && array.manualAdvanceMode == .operatorProceed))
+                    )
                     .help("Exit full screen (Esc)")
                 }
                 .padding(.horizontal, 16).padding(.vertical, 10)
@@ -873,7 +994,14 @@ struct FullscreenCameraView: View {
         }
         // Exit via Esc or the collapse button — the image itself is the
         // click-to-seed surface, so no tap-to-exit here.
-        .onExitCommand { array.fullScreenNodeID = nil }
+        .onExitCommand {
+            if !manualActive
+                || (array.manualPhase != .preparing
+                    && !(array.manualPhase == .trimming
+                        && array.manualAdvanceMode == .operatorProceed)) {
+                array.fullScreenNodeID = nil
+            }
+        }
     }
 }
 
@@ -1390,9 +1518,9 @@ struct ManualAssistPanel: View {
             .disabled(array.manualSessionActive)
             Text(array.manualTransform.isLog3G10
                  ? "Swaps the chosen output's Look (LCD or SDI) to Log3G10 for the match (18% gray = 33.3 IRE); restores it on Finish/Abort. Pick the output your livestream mirrors."
-                 : "Matches in the current display transform, outputs untouched (18% gray ≈ 42.3 IRE in IPP2).")
+                 : "Display/IPP2 stop math is not yet bench-calibrated, so capture is blocked in this mode. Select Log3G10 for exposure-accurate guidance.")
                 .font(.system(size: 10))
-                .foregroundStyle(Theme.ink3)
+                .foregroundStyle(array.manualTransform.isLog3G10 ? Theme.ink3 : Theme.warn)
                 .fixedSize(horizontal: false, vertical: true)
 
             Picker("Target", selection: $array.manualTargetMode) {
@@ -1420,24 +1548,37 @@ struct ManualAssistPanel: View {
             manualConfigRow("Tolerance", String(format: "±%.2fst", array.manualToleranceStops)) {
                 Slider(value: $array.manualToleranceStops, in: 0.02...0.30, step: 0.01)
             }
-            manualConfigRow("Stable hold", String(format: "%.1fs", array.manualHoldSeconds)) {
-                Slider(value: $array.manualHoldSeconds, in: 0.5...5.0, step: 0.5)
-            }
-
-            Toggle(isOn: $array.manualGuidedAdvance) {
-                Text("Guided auto-advance (fullscreen jumps to the next camera on match)")
-                    .font(Theme.mono(10.5))
+            .disabled(array.manualSessionActive)
+            HStack {
+                Text("Stable hold")
+                    .font(.system(size: 11))
                     .foregroundStyle(Theme.ink2)
+                Spacer()
+                Text(String(format: "%.1fs fixed", array.manualHoldSeconds))
+                    .font(Theme.mono(10.5, weight: .semibold))
+                    .foregroundStyle(Theme.ink)
             }
-            .toggleStyle(.switch)
-            .tint(Theme.accent)
 
-            if array.manualGuidedAdvance {
-                manualConfigRow("Settle before advance",
-                                String(format: "%.1fs", array.manualAdvanceDwellSeconds)) {
-                    Slider(value: $array.manualAdvanceDwellSeconds, in: 1...10, step: 0.5)
+            HStack {
+                Text("After match")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.ink2)
+                Spacer()
+            }
+            Picker("Advance mode", selection: $array.manualAdvanceMode) {
+                ForEach(ArrayController.ManualAdvanceMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
                 }
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(array.manualSessionActive)
+            Text(array.manualAdvanceMode == .automatic
+                 ? "After the stable hold completes, fullscreen advances to the next camera automatically."
+                 : "After the stable hold completes, a gated Proceed button lets the operator advance. R3DIris never changes cameras on its own.")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
                 switch array.manualPhase {
@@ -1464,10 +1605,21 @@ struct ManualAssistPanel: View {
                     Text("Restoring…")
                         .font(Theme.mono(10.5))
                         .foregroundStyle(Theme.ink2)
+                case .failed where array.manualRestorePending:
+                    Button("Retry Output Restore") { array.retryManualRestore() }
+                        .buttonStyle(DarkButtonStyle(prominent: true))
+                    Text("\(array.manualChangedOutputCount) pending")
+                        .font(Theme.mono(9.5, weight: .bold))
+                        .foregroundStyle(Theme.danger)
                 case .idle, .finished, .failed:
                     Button("Capture Target & Start") { array.startManualMatch() }
                         .buttonStyle(DarkButtonStyle(prominent: true))
-                        .disabled(array.manualTargetMode == .custom && array.manualCustomTargetIRE == nil)
+                        .disabled(
+                            !array.manualTransform.isLog3G10
+                                || array.qualityVerificationInProgress
+                                || (array.manualTargetMode == .custom
+                                    && array.manualCustomTargetIRE == nil)
+                        )
                 }
                 Spacer()
                 Text(array.manualPhase.rawValue.uppercased())
@@ -1484,7 +1636,7 @@ struct ManualAssistPanel: View {
                 HStack(spacing: 6) {
                     manualStat("TARGET", array.manualTargetIRE.map { String(format: "%.0f IRE", $0) } ?? "—")
                     manualStat("MATCHED", "\(array.manualMatchedCount)/\(array.manualParticipantCount)")
-                    manualStat("SPREAD", array.manualArraySpreadStops.map { String(format: "%.2fst", $0) } ?? "—")
+                    manualStat("LATEST SPREAD", array.manualArraySpreadStops.map { String(format: "%.2fst", $0) } ?? "—")
                 }
             }
 
@@ -1500,9 +1652,9 @@ struct ManualAssistPanel: View {
                 .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.dangerBG))
             }
 
-            if let selected = array.selectedNode,
-               array.isManualParticipant(selected) {
-                ManualTrimFocus(node: selected)
+            if let active = array.fullScreenNode,
+               array.isManualParticipant(active) {
+                ManualTrimFocus(node: active)
             }
 
             if !array.manualParticipants.isEmpty {
@@ -1574,6 +1726,7 @@ struct ManualTrimFocus: View {
     var info: ManualMatchInfo { node.manualMatch }
     private var cueColor: Color { ManualCueStyle.color(info.phase) }
     private var trimming: Bool { info.phase == .open || info.phase == .close }
+    private var recovering: Bool { info.phase == .recovering || node.streamRecovering }
 
     var body: some View {
         VStack(spacing: 9) {
@@ -1587,46 +1740,57 @@ struct ManualTrimFocus: View {
                     .tracking(1.4)
                     .foregroundStyle(Theme.accent)
             }
-            HStack(spacing: 10) {
-                HoldRing(phase: info.phase, stability: info.stability, size: 34)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(info.phase.rawValue)
-                        .font(.system(size: 19, weight: .heavy, design: .rounded))
-                        .tracking(1.4)
-                        .foregroundStyle(cueColor)
-                    if info.phase == .hold {
-                        Text("hold steady…")
-                            .font(.system(size: 9))
-                            .foregroundStyle(Theme.ink3)
+            if recovering {
+                HStack(spacing: 9) {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .font(.system(size: 25, weight: .bold))
+                        .foregroundStyle(Theme.warn)
+                    ManualRecoveryText(size: 19)
+                    Spacer()
+                }
+                .padding(.vertical, 16)
+            } else {
+                HStack(spacing: 10) {
+                    HoldRing(phase: info.phase, stability: info.stability, size: 34)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(info.phase.rawValue)
+                            .font(.system(size: 19, weight: .heavy, design: .rounded))
+                            .tracking(1.4)
+                            .foregroundStyle(cueColor)
+                        if info.phase == .hold {
+                            Text("hold steady…")
+                                .font(.system(size: 9))
+                                .foregroundStyle(Theme.ink3)
+                        }
+                    }
+                    if trimming {
+                        TrimChevrons(direction: info.phase == .open ? 1 : -1,
+                                     magnitudeStops: info.correctionStops ?? 0,
+                                     color: cueColor)
+                    }
+                    Spacer()
+                    if let correction = info.correctionStops, trimming {
+                        Text(String(format: "%+.2f ST", correction))
+                            .font(Theme.mono(18, weight: .bold))
+                            .foregroundStyle(cueColor)
+                            .help("Signed iris move: + open, − close")
                     }
                 }
-                if trimming {
-                    TrimChevrons(direction: info.phase == .open ? 1 : -1,
-                                 magnitudeStops: info.correctionStops ?? 0,
-                                 color: cueColor)
+                ManualTrimGauge(correctionStops: info.correctionStops.map { -$0 },
+                                toleranceStops: info.toleranceStops,
+                                color: cueColor)
+                    .frame(height: 30)
+                HStack {
+                    Text(info.currentIRE.map { String(format: "%.1f IRE", $0) } ?? "—")
+                    Spacer()
+                    Text(String(format: "band ±%.2f ST", info.toleranceStops))
+                        .foregroundStyle(Theme.ink3)
+                    Spacer()
+                    Text(info.targetIRE.map { String(format: "target %.0f", $0) } ?? "target —")
                 }
-                Spacer()
-                if let correction = info.correctionStops, trimming {
-                    Text(String(format: "%+.2f ST", correction))
-                        .font(Theme.mono(18, weight: .bold))
-                        .foregroundStyle(cueColor)
-                        .help("Signed iris move: + open, − close")
-                }
+                .font(Theme.mono(10.5))
+                .foregroundStyle(Theme.ink2)
             }
-            ManualTrimGauge(correctionStops: info.correctionStops.map { -$0 },
-                            toleranceStops: info.toleranceStops,
-                            color: cueColor)
-                .frame(height: 30)
-            HStack {
-                Text(info.currentIRE.map { String(format: "%.1f IRE", $0) } ?? "—")
-                Spacer()
-                Text(String(format: "band ±%.2f ST", info.toleranceStops))
-                    .foregroundStyle(Theme.ink3)
-                Spacer()
-                Text(info.targetIRE.map { String(format: "target %.0f", $0) } ?? "target —")
-            }
-            .font(Theme.mono(10.5))
-            .foregroundStyle(Theme.ink2)
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.panel3))
@@ -1640,7 +1804,11 @@ struct ManualCameraRow: View {
 
     var body: some View {
         Button {
-            array.selectedNodeID = node.id
+            if array.manualPhase == .trimming {
+                array.selectManualCamera(node)
+            } else {
+                array.selectedNodeID = node.id
+            }
         } label: {
             HStack(spacing: 7) {
                 Circle().fill(stateColor).frame(width: 6, height: 6)
@@ -1678,6 +1846,7 @@ struct ManualCameraRow: View {
         case .matched: return Theme.good
         case .hold: return Theme.accent
         case .open, .close: return Theme.warn
+        case .recovering: return Theme.warn
         case .unavailable: return Theme.danger
         case .acquiring, .idle: return Theme.idle
         }

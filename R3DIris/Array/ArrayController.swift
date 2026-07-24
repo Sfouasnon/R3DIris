@@ -191,7 +191,10 @@ final class ArrayController: ObservableObject {
     @Published var manualTargetMode: ManualTargetMode = .median
     @Published var manualTargetText: String = String(format: "%.1f", Log3G10.grayAnchorIRE)
     @Published var manualToleranceStops: Double = 0.10
-    @Published var manualHoldSeconds: Double = 2.0
+    /// One fixed production certification hold. Automatic mode advances
+    /// immediately after this completes; Operator Proceed keeps focus on the
+    /// matched camera until the operator explicitly continues.
+    let manualHoldSeconds: Double = 4.0
     @Published private(set) var manualPhase: ManualSessionPhase = .idle
     @Published private(set) var manualStatus: String = "Ready to capture a fixed target."
     @Published private(set) var manualTargetIRE: Double? = nil
@@ -218,19 +221,23 @@ final class ArrayController: ObservableObject {
     private var manualChangedOutputs: Set<UUID> = []
     /// Participants whose masks we froze for the transform swap (reversed on end).
     private var manualFrozenNodes: Set<UUID> = []
-    /// Single-operator guided flow: after a camera holds a match, focus jumps to
-    /// the next unmatched camera (ID order) in fullscreen, and snaps back to any
-    /// certified camera that later drifts out of tolerance.
-    @Published var manualGuidedAdvance = true
-    /// How long the focused camera must stay continuously matched before focus
-    /// advances — breathing room to settle onto the true target with small
-    /// re-adjustments instead of jumping the instant it first reads matched.
-    @Published var manualAdvanceDwellSeconds: Double = 4.0
-    /// When the focused camera began its current unbroken matched stretch (nil
-    /// whenever it isn't matched). Drives the advance dwell.
-    private var manualFocusDwellSince: Date?
+    enum ManualAdvanceMode: String, CaseIterable, Identifiable {
+        case automatic = "Automatic"
+        case operatorProceed = "Operator Proceed"
+        var id: String { rawValue }
+    }
+    /// Automatic is the existing/default guided behavior. Operator Proceed uses
+    /// the same four-second certification gate but never changes cameras until
+    /// the operator presses the matched-only Proceed button.
+    @Published var manualAdvanceMode: ManualAdvanceMode = .automatic
     /// Cameras that have reached a held match and not since drifted out.
     private var manualCertified: Set<UUID> = []
+    /// Final read-only quality proof for the currently focused camera. The
+    /// four-second hold cannot certify until a fresh rcp_get returns the same
+    /// actual factor captured by array preflight.
+    private var manualCertificationQualityApprovedID: UUID?
+    private var manualCertificationQualityTask: Task<Void, Never>?
+    private var manualCertificationQualityGeneration: UInt64 = 0
     /// True once a session actually reached the Log3G10 transform stage. Lets the
     /// end message distinguish "nothing needed changing" from "blocked before we
     /// touched any output" (which must NOT claim the outputs are in Log3G10).
@@ -241,13 +248,58 @@ final class ArrayController: ObservableObject {
         node.status.displayID.isEmpty ? node.ip : node.status.displayID
     }
 
+    private func orderedManualParticipants(_ parts: [CameraNode]) -> [CameraNode] {
+        parts.sorted { manualIDKey($0) < manualIDKey($1) }
+    }
+
+    /// The next body that has not yet completed its own four-second focused
+    /// certification. Wrap so an operator may begin on any camera in the array.
+    private func nextUncertifiedManualCamera(
+        after current: CameraNode,
+        in parts: [CameraNode]
+    ) -> CameraNode? {
+        let ordered = orderedManualParticipants(parts)
+        guard ordered.count > 1,
+              let index = ordered.firstIndex(where: { $0.id == current.id }) else {
+            return nil
+        }
+        for offset in 1..<ordered.count {
+            let candidate = ordered[(index + offset) % ordered.count]
+            if !manualCertified.contains(candidate.id) { return candidate }
+        }
+        return nil
+    }
+
     /// Move fullscreen focus (and selection) to a camera during the guided flow.
     private func focusManual(on node: CameraNode) {
-        guard fullScreenNodeID != node.id else { return }
+        guard manualParticipantIDs.contains(node.id) else { return }
+        let changed = fullScreenNodeID != node.id
         fullScreenNodeID = node.id
         selectedNodeID = node.id
-        manualFocusDwellSince = nil   // new camera starts its dwell fresh
-        log("manual match: focus → \(manualIDKey(node))")
+        if changed {
+            log("manual match: focus → \(manualIDKey(node))")
+            applyManualStreamSchedule(manualParticipants)
+        }
+    }
+
+    /// Operator-facing focus request. In Operator Proceed mode the current
+    /// camera owns focus until the explicit, quality-reverified Proceed action;
+    /// row clicks and generic fullscreen navigation cannot bypass that gate.
+    func selectManualCamera(_ node: CameraNode) {
+        guard manualPhase == .trimming,
+              manualParticipantIDs.contains(node.id) else {
+            return
+        }
+        if manualAdvanceMode == .operatorProceed,
+           let currentID = fullScreenNodeID,
+           currentID != node.id {
+            let currentName = fullScreenNode.map(manualIDKey) ?? "Current camera"
+            manualStatus = manualCertified.contains(currentID)
+                ? "\(currentName) is certified — use Proceed for the verified handoff."
+                : "\(currentName) must complete its focused match before proceeding."
+            return
+        }
+        focusManual(on: node)
     }
     private var manualEndRequested = false
     private var manualEndMessage = "Manual Assist aborted by operator."
@@ -260,13 +312,21 @@ final class ArrayController: ObservableObject {
     static let settleTimeout: TimeInterval = 10
     static let measureTimeout: TimeInterval = 6
     static let maxRounds = 16
-    /// How long "Capture Target & Start" waits for every connected camera to be
-    /// stream-live and sphere-locked before it gives up. On a busy bench the
-    /// livestreams flap (auto-recover restarts, brief timeouts), so a single
-    /// instantaneous snapshot would reject a fully-seeded array just because one
-    /// camera happened to be mid-restart at the click. This bound covers a
-    /// stream restart's enable delay + first-frame settle with margin.
+    /// How long the one-camera Capture + Start queue waits for a locally-woken
+    /// participant to prove its transport and native ROI measurement path.
     static let manualReadyGrace: TimeInterval = 12
+    /// Capture + Start is expected immediately after sphere solving. Require a
+    /// recent native reading from every trusted lock before parking the array so
+    /// an old candidate/ROI cannot be frozen and sampled as if it were current.
+    static let manualSolveFreshness: TimeInterval = 5
+    /// Once a camera has changed transform, keep its one live feed visible long
+    /// enough for the operator to see the Log3G10 result before the queue parks
+    /// it and advances. This is a presentation floor, not a measurement delay.
+    static let manualVisualVerificationSeconds: TimeInterval = 0.75
+    /// DISPLAY_PRESET is value-with-target: SET confirmation can precede CUR by
+    /// several video frames. Discard this post-SET interval before establishing
+    /// the baseline epoch so transitional frames cannot contaminate the median.
+    static let manualTransformSettleSeconds: TimeInterval = 0.75
 
     // MARK: - Stream auto-recovery
     /// Automatically restart a participant's livestream if it drops or stalls.
@@ -274,13 +334,20 @@ final class ArrayController: ObservableObject {
     /// a 36-camera calibration must not depend on someone noticing a dead tile.
     @Published var autoRecoverStreams = true
     private var streamRetryCount: [UUID: Int] = [:]
+    private var streamLastRetryAt: [UUID: Date] = [:]
     private var watchdogTask: Task<Void, Never>?
-    /// A stream must be silent for this long before it's considered dead — well
-    /// past normal frame jitter at ~20 fps.
+    /// Normal preview/solve feeds get a conservative transport timeout. Focused
+    /// Manual Assist feedback fails into HOLD much sooner.
     private static let streamStallTimeout: TimeInterval = 8.0
-    /// And we never touch a stream until this long after it (re)started, so the
-    /// enable delay and first-frame settle can never look like a stall. This also
-    /// spaces retries: a still-dead camera is only restarted once per grace.
+    private static let focusedStreamStallTimeout: TimeInterval = 1.5
+    private static let warmStreamStallTimeout: TimeInterval = 3.0
+    /// Focused hold progress is measurement-driven. If native ROI samples pause
+    /// longer than this, stale wall-clock time cannot accrue toward certification.
+    private static let focusedMeasurementContinuity: TimeInterval = 0.5
+    /// Normal preview/solve feeds receive a long post-start grace so camera
+    /// enable and first-frame settle cannot look like a stall. Focused and warm
+    /// roles use their shorter role timeout because they are already HTTP-only
+    /// wakes inside a measurement-critical session.
     private static let streamStartGrace: TimeInterval = 10.0
 
     init() {
@@ -302,46 +369,72 @@ final class ArrayController: ObservableObject {
         }
     }
 
-    /// Restart the livestream on a camera that is *supposed* to be streaming but
-    /// has genuinely gone dead. Deliberately conservative so it never fights
-    /// normal startup or a healthy feed:
-    ///   • only nodes with `streamingDesired`,
-    ///   • only once the stream is `streamStartGrace` past its last (re)start
-    ///     (so the ~0.7 s enable delay and first-frame settle are never a "stall"),
-    ///   • dead = no frame for `streamStallTimeout` (or none ever, past grace),
-    ///     or the reader reported a hard drop / frozen feed.
-    /// Because a restart resets `lastStreamStartAt`, the grace also spaces retries
-    /// (~one attempt per 10 s) — no separate backoff needed. Touches only the
-    /// livestream: never seeds, masks, or the Log3G10 swap.
+    /// Recover local HTTP readers only. Pixel sameness is deliberately excluded:
+    /// a solved sphere is expected to remain still. Parked readers are intentional
+    /// and therefore invisible to the watchdog. Retry timing is bounded and
+    /// role-aware so a focused camera receives urgent service without a 40-camera
+    /// recovery wave.
     func recoverDeadStreams() {
         guard autoRecoverStreams else { return }
         let now = Date()
-        for node in nodes where node.connected && node.streamingDesired {
+        for node in nodes where node.connected
+            && node.streamingDesired
+            && node.streamRole != .parked {
             // Still inside the post-(re)start settle window — leave it alone.
+            let startGrace: TimeInterval
+            switch node.streamRole {
+            case .focused: startGrace = Self.focusedStreamStallTimeout
+            case .warm: startGrace = Self.warmStreamStallTimeout
+            case .normal: startGrace = Self.streamStartGrace
+            case .parked: continue
+            }
             if let started = node.lastStreamStartAt,
-               now.timeIntervalSince(started) < Self.streamStartGrace { continue }
+               !node.streamRecovering,
+               now.timeIntervalSince(started) < startGrace { continue }
 
             let last = node.stream.stats.lastFrameAt
-            let dead: Bool
-            if let last {
-                // Delivered frames before; dead only if they've stopped for a while
-                // (a hard drop / frozen feed also means frames have stopped).
-                dead = now.timeIntervalSince(last) > Self.streamStallTimeout
-                    || !node.stream.isStreaming || node.streamStale
-            } else {
-                // Never delivered a frame and grace has elapsed — it's not coming.
-                dead = true
+            let timeout: TimeInterval
+            switch node.streamRole {
+            case .focused: timeout = Self.focusedStreamStallTimeout
+            case .warm: timeout = Self.warmStreamStallTimeout
+            case .normal: timeout = Self.streamStallTimeout
+            case .parked: continue
             }
+            let dead = !node.stream.isStreaming
+                || last.map { now.timeIntervalSince($0) > timeout } ?? true
 
             if dead {
-                let attempt = (streamRetryCount[node.id] ?? 0) + 1
-                streamRetryCount[node.id] = attempt
-                node.startStream()   // resets lastStreamStartAt → next attempt ≥ grace away
-                log("auto-recover: \(node.ip) livestream dead — restart (attempt \(attempt))")
-            } else if streamRetryCount[node.id] != nil {
-                streamRetryCount[node.id] = nil   // healthy again
+                requestStreamRecovery(node, now: now)
+            } else if streamRetryCount[node.id] != nil || node.streamRecovering {
+                streamRetryCount[node.id] = nil
+                streamLastRetryAt[node.id] = nil
             }
         }
+    }
+
+    /// Single recovery gate shared by the 0.5 Hz watchdog and the 20 Hz focused
+    /// guidance loop. The first HTTP-only reopen is immediate; subsequent attempts
+    /// back off. No attempt writes camera quality or livestream enable.
+    private func requestStreamRecovery(_ node: CameraNode, now: Date = Date()) {
+        guard autoRecoverStreams, node.connected, node.streamingDesired,
+              node.streamRole != .parked else { return }
+        let attempt = (streamRetryCount[node.id] ?? 0) + 1
+        let delays: [TimeInterval]
+        switch node.streamRole {
+        case .focused: delays = [0, 3, 5, 8, 15, 30]
+        case .warm: delays = [0, 3, 8, 15, 30]
+        case .normal: delays = [0, 5, 10, 20, 30]
+        case .parked: return
+        }
+        let delay = delays[min(attempt - 1, delays.count - 1)]
+        if let lastAttempt = streamLastRetryAt[node.id],
+           now.timeIntervalSince(lastAttempt) < delay { return }
+        streamRetryCount[node.id] = attempt
+        streamLastRetryAt[node.id] = now
+        let age = node.stream.stats.lastFrameAt.map {
+            String(format: "%.1fs without a JPEG", now.timeIntervalSince($0))
+        } ?? "no JPEG received"
+        node.reopenLocalStream(reason: age, attempt: attempt)
     }
 
     // MARK: - Discovery
@@ -551,6 +644,75 @@ final class ArrayController: ObservableObject {
         return true
     }
 
+    /// Capture + Start follows sphere solving within seconds. The camera factors
+    /// are already configured, so this preflight is read-only: query each body's
+    /// runtime list/current value and compare them without rewriting quality or
+    /// restarting any HTTP reader.
+    private func verifyExistingUniformLivestreamQuality(
+        _ parts: [CameraNode],
+        context: String
+    ) async -> Bool {
+        guard !parts.isEmpty else { return false }
+        arrayActualQuality = nil
+        qualityVerifiedParticipantIDs.removeAll()
+        arrayQualityStatus = "Reading existing camera quality factors…"
+        log("array quality: \(context) — read-only actual comparison on \(parts.count) participant(s)")
+
+        var cameras: [(UUID, CameraActor)] = []
+        for node in parts {
+            guard let camera = node.camera else {
+                arrayQualityStatus = "Blocked: \(node.displayName) has no camera session."
+                return false
+            }
+            cameras.append((node.id, camera))
+        }
+
+        var byID: [UUID: LivestreamQualityVerification] = [:]
+        await withTaskGroup(of: (UUID, LivestreamQualityVerification).self) { group in
+            for (id, camera) in cameras {
+                group.addTask {
+                    let options = await camera.getLivestreamQualityOptions()
+                    let actual = await camera.readLivestreamQuality()
+                    return (
+                        id,
+                        LivestreamQualityVerification(
+                            requested: actual ?? -1,
+                            actual: actual,
+                            options: options
+                        )
+                    )
+                }
+            }
+            for await (id, result) in group { byID[id] = result }
+        }
+
+        let readings = parts.compactMap { node in byID[node.id].map { (node, $0) } }
+        let missing = readings.filter { $0.1.actual == nil }.map { $0.0.displayName }
+        guard readings.count == parts.count, missing.isEmpty else {
+            arrayQualityStatus = "Blocked: no actual quality read-back from \(missing.joined(separator: ", "))."
+            log("array quality: BLOCKED — read-only actual missing: \(missing.joined(separator: ", "))")
+            return false
+        }
+        let actualValues = Set(readings.compactMap { $0.1.actual })
+        guard actualValues.count == 1, let actual = actualValues.first else {
+            let detail = readings.map {
+                "\($0.0.displayName)=\($0.1.actual.flatMap { RCP2.livestreamQualityLabels[$0] } ?? "NO REPLY")"
+            }.joined(separator: ", ")
+            arrayQualityStatus = "Blocked: participant read-backs differ (\(detail))."
+            log("array quality: MISMATCH / measurement BLOCKED — \(detail)")
+            return false
+        }
+
+        arrayActualQuality = actual
+        qualityVerifiedParticipantIDs = Set(parts.map(\.id))
+        arrayQuality = actual
+        for (node, _) in readings { node.desiredQuality = actual }
+        let label = RCP2.livestreamQualityLabels[actual] ?? "\(actual)"
+        arrayQualityStatus = "Locked \(label) across \(parts.count) existing actual read-backs."
+        log("array quality: PASS — existing actual read-back \(label) on every participant")
+        return true
+    }
+
     /// A verified array value is evidence about the cameras' *current* actual
     /// read-backs, not a sticky preference. Reconnects clear CameraActor state,
     /// and an external quality change can arrive at any time, so invalidate the
@@ -617,12 +779,17 @@ final class ArrayController: ObservableObject {
     /// Cycle the fullscreen camera to the next/prev body in ID order — hands-free
     /// seeding without minimize + double-click. delta +1 = next, -1 = previous.
     func fullscreenStep(_ delta: Int) {
-        guard let current = fullScreenNodeID, !nodes.isEmpty else { return }
-        let ordered = nodes.sorted { manualIDKey($0) < manualIDKey($1) }
+        let candidates = manualSessionActive ? manualParticipants : nodes
+        guard let current = fullScreenNodeID, !candidates.isEmpty else { return }
+        let ordered = candidates.sorted { manualIDKey($0) < manualIDKey($1) }
         guard let idx = ordered.firstIndex(where: { $0.id == current }) else { return }
         let next = ordered[(idx + delta + ordered.count) % ordered.count]
-        fullScreenNodeID = next.id
-        selectedNodeID = next.id
+        if manualSessionActive {
+            selectManualCamera(next)
+        } else {
+            fullScreenNodeID = next.id
+            selectedNodeID = next.id
+        }
     }
 
     func cancelSeed(_ node: CameraNode) { node.cancelSeed() }
@@ -670,7 +837,7 @@ final class ArrayController: ObservableObject {
 
     func removeCamera(_ node: CameraNode) {
         if fullScreenNodeID == node.id { fullScreenNodeID = nil }
-        guard !manualSessionActive else {
+        guard !manualSessionActive, !manualRestorePending else {
             log("remove camera: blocked while Manual Assist owns reversible output state — Finish or Abort first")
             return
         }
@@ -693,14 +860,25 @@ final class ArrayController: ObservableObject {
         // what it did so the button isn't a silent no-op.
         var connecting = 0, revived = 0
         for node in nodes {
-            if node.connected { node.refresh(); revived += 1 }
-            else { node.connect(sourceIP: s); connecting += 1 }
+            if node.connected {
+                node.refresh()
+                revived += 1
+            } else if node.camera == nil {
+                node.connect(sourceIP: s)
+                connecting += 1
+            } else {
+                // A CameraActor can exist while its RCP link is parked/down.
+                // `connect()` intentionally no-ops in that state; revive the
+                // existing actor so a pending output restore can be retried.
+                node.refresh()
+                connecting += 1
+            }
         }
         log("connect all: \(connecting) connecting, \(revived) already up (revived)")
     }
 
     func disconnectAll() {
-        guard !manualSessionActive else {
+        guard !manualSessionActive, !manualRestorePending else {
             log("disconnect all: blocked while Manual Assist owns reversible output state — Finish or Abort first")
             return
         }
@@ -715,7 +893,18 @@ final class ArrayController: ObservableObject {
     func streamAll() {
         guard !manualSessionActive else { return }
         for node in nodes where node.connected && !node.stream.isStreaming {
-            node.startStream()
+            if node.streamingDesired {
+                if node.streamRole == .parked {
+                    // A completed Manual Assist session intentionally leaves
+                    // local readers parked. Stream All revives those readers
+                    // without rewriting camera enable or quality.
+                    node.setStreamRole(.normal)
+                } else {
+                    node.reopenLocalStream(reason: "operator Stream All", attempt: 1)
+                }
+            } else {
+                node.startStream()
+            }
         }
     }
 
@@ -731,19 +920,49 @@ final class ArrayController: ObservableObject {
         let s = src.isEmpty ? nil : src
         var reconnected = 0, restreamed = 0
         for node in nodes {
+            // During Manual Assist, do not let a global recovery action expand
+            // the scheduler's reader budget. Outsiders are left untouched;
+            // parked participants may have their RCP actor revived but only the
+            // focused/warm roles are eligible for an HTTP-only reopen.
+            if manualSessionActive, !manualParticipantIDs.contains(node.id) {
+                continue
+            }
+            let manualHTTPRoleIsActive =
+                node.streamRole == .focused || node.streamRole == .warm
+            let mayOpenLocalReader = !manualSessionActive
+                || (manualHTTPRoleIsActive && node.streamingDesired)
+
             if !node.connected {
                 // Session fully dropped (camera == nil) — rebuild it. Its seed is
                 // already gone in this case and will need re-placing.
-                node.connect(sourceIP: s)
-                node.startStream()
+                if node.camera == nil {
+                    node.connect(sourceIP: s)
+                } else {
+                    node.refresh()
+                }
+                // An intentionally parked participant stays parked. A focused
+                // or warm participant reopens only its local HTTP reader.
+                if node.streamRole != .parked, mayOpenLocalReader {
+                    if node.streamingDesired {
+                        node.reopenLocalStream(reason: "operator reconnect", attempt: 1)
+                    } else {
+                        node.startStream()
+                    }
+                }
                 reconnected += 1
-            } else if !node.stream.isStreaming {
+            } else if !node.stream.isStreaming,
+                      node.streamRole != .parked,
+                      mayOpenLocalReader {
                 node.refresh()        // revive the RCP session
-                node.startStream()    // re-enable + reopen the MJPEG stream
+                if node.streamingDesired {
+                    node.reopenLocalStream(reason: "operator reconnect", attempt: 1)
+                } else {
+                    node.startStream()
+                }
                 restreamed += 1
             }
         }
-        log("reconnect: \(reconnected) session(s) rebuilt, \(restreamed) livestream(s) restarted, seeds/transform preserved")
+        log("reconnect: \(reconnected) session(s) revived, \(restreamed) active local reader(s) reopened; parked readers left idle")
     }
 
     /// Capability gate + APERTURE subscription on every connected body — one
@@ -769,7 +988,7 @@ final class ArrayController: ObservableObject {
     @Published private(set) var savedPresetCount = 0
 
     func setLog3G10OnArray() {
-        guard !loopRunning, !manualSessionActive else { return }
+        guard !loopRunning, !manualSessionActive, !manualRestorePending else { return }
         Task {
             let targets = nodes.filter(\.connected)
             guard !targets.isEmpty else {
@@ -803,7 +1022,8 @@ final class ArrayController: ObservableObject {
     /// the mirrored output changed or a third preset appeared mid-session) —
     /// refused bodies KEEP their saved value so the operator can retry.
     func restorePresetsOnArray() {
-        guard !loopRunning, !manualSessionActive, !savedLoopTransforms.isEmpty else { return }
+        guard !loopRunning, !manualSessionActive, !manualRestorePending,
+              !savedLoopTransforms.isEmpty else { return }
         Task {
             log("restore presets: starting on \(savedLoopTransforms.count) camera(s)")
             var restored = 0
@@ -834,7 +1054,14 @@ final class ArrayController: ObservableObject {
         }
     }
 
-    var workflowBusy: Bool { loopRunning || manualSessionActive }
+    /// A failed output restore remains owned reversible state even though the
+    /// measurement task has ended. It must block new workflows until retried.
+    var manualRestorePending: Bool { !manualChangedOutputs.isEmpty }
+    var manualChangedOutputCount: Int { manualChangedOutputs.count }
+
+    var workflowBusy: Bool {
+        loopRunning || manualSessionActive || manualRestorePending
+    }
 
     var manualParticipants: [CameraNode] {
         nodes.filter { manualParticipantIDs.contains($0.id) }
@@ -855,7 +1082,15 @@ final class ArrayController: ObservableObject {
     /// this deliberately ignores APERTURE_CONTROL and never sends APERTURE.
     /// Every connected + streaming participant must have a trusted sphere lock.
     func startManualMatch() {
-        guard manualTask == nil, !loopRunning, !manualSessionActive, !qualityControlsLocked else { return }
+        guard manualTask == nil, !loopRunning, !manualSessionActive,
+              !manualRestorePending, !qualityControlsLocked,
+              !qualityVerificationInProgress else { return }
+        guard manualTransform.isLog3G10 else {
+            manualPhase = .failed
+            manualStatus =
+                "Display (IPP2) stop guidance is not calibrated. Select Log3G10 for an exposure-accurate Manual Assist session."
+            return
+        }
         guard manualTargetMode != .custom || manualCustomTargetIRE != nil else {
             manualPhase = .failed
             manualStatus = "Custom target must be a valid Log3G10 IRE between 0 and 100."
@@ -872,7 +1107,6 @@ final class ArrayController: ObservableObject {
         manualMatchedCount = 0
         manualArraySpreadStops = nil
         manualCommonDriftStops = nil
-        for node in nodes { node.fastAnalysis = false }   // back to the 3 Hz cadence
         manualParticipantIDs.removeAll()
         manualStableSince.removeAll()
         manualArrayStableSince = nil
@@ -882,9 +1116,10 @@ final class ArrayController: ObservableObject {
         manualChangedOutputs.removeAll()
         manualFrozenNodes.removeAll()
         manualCertified.removeAll()
+        invalidateManualCertificationQualityProof()
         manualEnteredTransformStage = false
-        manualFocusDwellSince = nil
-        for node in nodes { node.manualMatch = ManualMatchInfo(); node.focusedTrim = false }
+        fullScreenNodeID = nil
+        for node in nodes { node.manualMatch = ManualMatchInfo() }
 
         manualPhase = .preparing
         manualStatus = "Checking streams, sphere locks, and mirrored outputs…"
@@ -910,6 +1145,22 @@ final class ArrayController: ObservableObject {
         manualPhase = .restoring
         manualStatus = "Match verified — restoring saved output presets…"
         log("manual match: finish requested")
+    }
+
+    /// Retry only the exact output restores that previously failed. Saved
+    /// preset values remain in memory until every changed camera confirms its
+    /// restore, so a transient RCP loss cannot silently strand Log3G10.
+    func retryManualRestore() {
+        guard manualTask == nil, manualRestorePending,
+              !manualSessionActive else { return }
+        manualEndWasFailure = false
+        manualEndMessage = "Manual Assist restore retry complete."
+        manualEndRequested = true
+        manualPhase = .restoring
+        manualStatus = "Retrying saved output presets…"
+        qualityControlsLocked = true
+        log("manual match: retrying \(manualChangedOutputs.count) outstanding output restore(s)")
+        manualTask = Task { await closeManualMatch() }
     }
 
     /// End-of-set action: capture the report (stills are grabbed NOW, while the
@@ -943,16 +1194,72 @@ final class ArrayController: ObservableObject {
     }
 
     private func runManualMatchSession() async {
-        // Disconnected nodes are outside the active array, but every connected
-        // body must stream and lock before capture. Never silently certify a
-        // partial connected array.
+        guard !manualEndRequested else {
+            await closeManualMatch()
+            return
+        }
+        // Disconnected nodes are outside the active array. Sphere solving has
+        // just completed, so each connected participant must retain a solved ROI
+        // and an enabled livestream intent, but Capture + Start deliberately does
+        // NOT keep every HTTP reader live. It parks them, then wakes one camera at
+        // a time for transform verification and baseline capture.
         let parts = nodes.filter(\.connected)
         guard parts.count >= 2 else {
             await failManualMatch("Need at least two connected cameras for Manual Assist.")
             return
         }
-        guard await verifyUniformLivestreamQuality(parts, requested: arrayQuality,
-                                                   context: "Manual Assist preflight") else {
+        let unsolved = parts.filter {
+            !$0.sphere.measurable || !$0.streamingDesired
+        }
+        guard unsolved.isEmpty else {
+            await failManualMatch(
+                "Lock a measurable sphere and start its stream before Capture + Start on: " +
+                    unsolved.map(\.displayName).joined(separator: ", ")
+            )
+            return
+        }
+        let freshnessEpoch = Date()
+        let staleSolve = parts.filter { node in
+            guard let measuredAt = node.sphere.measuredAt else { return true }
+            return freshnessEpoch.timeIntervalSince(measuredAt)
+                > Self.manualSolveFreshness
+        }
+        guard staleSolve.isEmpty else {
+            await failManualMatch(
+                "Sphere solve is no longer fresh on: "
+                    + staleSolve.map(\.displayName).joined(separator: ", ")
+                    + ". Wake/re-solve those cameras, then Capture + Start."
+            )
+            return
+        }
+
+        manualParticipantIDs = Set(parts.map(\.id))
+        manualParticipantCount = parts.count
+        let ordered = orderedManualParticipants(parts)
+        selectedNodeID = ordered.first?.id
+        for node in parts {
+            node.manualMatch.phase = .acquiring
+            node.manualMatch.detail = "queued for transform + baseline capture"
+        }
+        log("manual match: preparing \(parts.count) camera(s) through one local MJPEG reader; APERTURE commands disabled")
+
+        // Shed the N-camera decode/network workload immediately when Capture +
+        // Start is pressed. Sphere solving just finished, so the solved ROIs and
+        // RCP sessions are fresh; parking touches neither of them.
+        let parkEpoch = Date()
+        for node in nodes where node.streamingDesired || node.stream.isStreaming {
+            transitionManualStreamRole(node, to: .parked, now: parkEpoch)
+        }
+
+        let qualityVerified = await verifyExistingUniformLivestreamQuality(
+            parts,
+            context: "Manual Assist preflight"
+        )
+        guard !manualEndRequested else {
+            await closeManualMatch()
+            return
+        }
+        guard qualityVerified else {
             await failManualMatch("Livestream quality verification failed. Every participant must return the same actual quality before capture. \(arrayQualityStatus)")
             return
         }
@@ -961,103 +1268,163 @@ final class ArrayController: ObservableObject {
             return
         }
         manualExpectedQuality = verifiedQuality
-        // Streams flap on a busy bench (auto-recover restarts, brief timeouts), so
-        // a single instantaneous snapshot of "is everyone streaming and locked?"
-        // would reject a fully-seeded array just because one camera was mid-restart
-        // at the exact moment the operator pressed Capture. Wait a bounded window
-        // for every connected camera to be stream-live AND holding a measurable
-        // sphere lock before giving up. Seeds already coast through detection
-        // misses, so the only real transient here is the livestream re-establishing.
-        if let notReady = await awaitManualReady(parts) {
-            if manualEndRequested { await closeManualMatch() }
-            else { await failManualMatch(notReady) }
-            return
-        }
-        guard !manualEndRequested else { await closeManualMatch(); return }
 
-        manualParticipantIDs = Set(parts.map(\.id))
-        for node in parts { node.fastAnalysis = true }   // human-in-the-loop fast path
-        manualParticipantCount = parts.count
-        if !manualParticipantIDs.contains(selectedNodeID ?? UUID()) {
-            selectedNodeID = parts.first?.id
-        }
-        for node in parts {
-            node.manualMatch.phase = .acquiring
-            node.manualMatch.detail = "capturing output state"
-        }
-        log("manual match: preparing \(parts.count) camera(s); APERTURE commands disabled")
-
-        // Log3G10 · LCD / · SDI swap that output's "Look" (SDI_COLOR_SETTING) to
-        // COLOR_SETTING_LOG for the match, then restore the original (3D LUT /
-        // Custom Display) on Finish/Abort. Display (IPP2) leaves everything
-        // untouched. The livestream mirror source is READ-ONLY status, so the
-        // operator picks the output the stream is actually mirroring; we warn if
-        // the two don't match.
+        // Freeze every solved ROI before any transform swap or local HTTP wake.
+        // The sphere and camera should not move between solving and Capture +
+        // Start; the wake gate below nevertheless requires fresh native samples.
         if manualTransform.isLog3G10 {
-            manualEnteredTransformStage = true
-            // Freeze every participant's mask BEFORE the swap. The flat/desaturated
-            // Log3G10 look breaks appearance-based detection, so a non-seeded lock
-            // coasts then times out (~3 s) and the all-camera baseline gate fails —
-            // exactly the 2026-07-21 revert. Frozen masks hold geometry and keep
-            // measuring hero IRE at the fixed ROI through the appearance change.
-            // Reversed in closeManualMatch(). Operator seeds are already frozen and
-            // are left untouched.
             for node in parts where node.freezeTransformLock() {
                 manualFrozenNodes.insert(node.id)
             }
             if !manualFrozenNodes.isEmpty {
                 log("manual match: froze \(manualFrozenNodes.count) auto-locked mask(s) to hold through the Log3G10 swap")
             }
-            manualStatus = "Setting Log3G10 on each camera's mirrored output…"
-            for node in parts {
-                guard !manualEndRequested else { await closeManualMatch(); return }
-                guard let camera = node.camera else {
-                    await failManualMatch("Camera actor unavailable for \(node.ip).")
-                    return
-                }
-                // Resolve the exact output feeding THIS camera's livestream mirror
-                // (reads LIVESTREAM_MIRROR_SOURCE, picks the advertised
-                // SDI_COLOR_SETTING param, and reads its current Look). This is the
-                // fix for the 2026-07-20 failure: we no longer guess LCD-vs-SDI, so
-                // the swap always lands on the output the analyzer actually sees.
-                let reading = await camera.readActiveMonitorTransform()
-                guard !reading.parameterID.isEmpty, let before = reading.presetValue else {
-                    await failManualMatch("Cannot resolve/read the Look on \(node.ip)'s livestream mirror output; no output left in an unknown state.")
-                    return
-                }
-                manualSavedTransforms[node.id] = reading
-                // Already Log3G10? leave it (and don't mark it changed).
-                guard before != RCP2.log3G10DisplayPresetValue else { continue }
-                manualChangedOutputs.insert(node.id)
-                let ok = await camera.setMonitorDisplayPreset(
-                    parameterID: reading.parameterID, value: RCP2.log3G10DisplayPresetValue,
-                    reason: "manual match Log3G10")
-                guard ok else {
-                    await failManualMatch("Could not set Log3G10 on \(node.ip) (\(reading.parameterID)).")
-                    return
-                }
-            }
         } else {
             log("manual match: Display (IPP2) — outputs untouched, 18% gray anchored at \(String(format: "%.1f", Self.ipp2GrayAnchorIRE)) IRE")
         }
 
-        guard !manualEndRequested else { await closeManualMatch(); return }
-        manualStatus = "Waiting for post-transform frames…"
-        let freshEpoch = Date()
-        let fresh = await waitFreshMeasurements(parts, after: freshEpoch)
-        guard !manualEndRequested else { await closeManualMatch(); return }
-        guard fresh else {
-            await failManualMatch("Livestream measurements did not refresh after the output change.")
-            return
-        }
+        var baselines: [UUID: Double] = [:]
+        for (index, node) in ordered.enumerated() {
+            guard !manualEndRequested else { await closeManualMatch(); return }
+            if let qualityFailure = manualQualityInvariantFailure(
+                parts,
+                expected: verifiedQuality
+            ) {
+                await failManualMatch("Measurement stopped: \(qualityFailure)")
+                return
+            }
+            selectedNodeID = node.id
+            fullScreenNodeID = node.id
+            manualStatus =
+                "\(node.displayName): waking stream \(index + 1)/\(ordered.count)…"
+            let wakeEpoch = Date()
+            transitionManualStreamRole(node, to: .focused, now: wakeEpoch)
+            guard await waitForManualCameraReady(node, after: wakeEpoch) else {
+                if manualEndRequested {
+                    await closeManualMatch()
+                } else {
+                    await failManualMatch(
+                        "\(node.displayName) did not deliver three fresh native sphere measurements."
+                    )
+                }
+                return
+            }
 
-        manualStatus = "Capturing stable sphere baselines…"
-        guard let baselines = await captureManualBaselines(parts) else {
-            if manualEndRequested { await closeManualMatch() }
-            else { await failManualMatch("Could not capture stable locked-sphere baselines on every camera.") }
-            return
+            guard let camera = node.camera else {
+                await failManualMatch("Camera actor unavailable for \(node.ip).")
+                return
+            }
+            manualStatus =
+                "\(node.displayName): verifying actual stream quality \(index + 1)/\(ordered.count)…"
+            let focusedQuality = await camera.readLivestreamQuality()
+            guard !manualEndRequested else {
+                await closeManualMatch()
+                return
+            }
+            guard focusedQuality == verifiedQuality else {
+                let actual = focusedQuality
+                    .flatMap { RCP2.livestreamQualityLabels[$0] } ?? "NO READ-BACK"
+                await failManualMatch(
+                    "\(node.displayName) returned \(actual) while focused; expected \(RCP2.livestreamQualityLabels[verifiedQuality] ?? "\(verifiedQuality)")."
+                )
+                return
+            }
+
+            let visualVerificationStarted = Date()
+            var baselineEpoch = Date()
+            if manualTransform.isLog3G10 {
+                manualStatus =
+                    "\(node.displayName): setting and visually verifying Log3G10 \(index + 1)/\(ordered.count)…"
+                let reading = await camera.readActiveMonitorTransform()
+                guard !manualEndRequested else {
+                    await closeManualMatch()
+                    return
+                }
+                guard !reading.parameterID.isEmpty, let before = reading.presetValue else {
+                    await failManualMatch(
+                        "Cannot resolve/read the Look on \(node.ip)'s livestream mirror output."
+                    )
+                    return
+                }
+                manualSavedTransforms[node.id] = reading
+                if before != RCP2.log3G10DisplayPresetValue {
+                    manualChangedOutputs.insert(node.id)
+                    let ok = await camera.setMonitorDisplayPreset(
+                        parameterID: reading.parameterID,
+                        value: RCP2.log3G10DisplayPresetValue,
+                        reason: "manual match Log3G10"
+                    )
+                    guard !manualEndRequested else {
+                        await closeManualMatch()
+                        return
+                    }
+                    guard ok else {
+                        await failManualMatch(
+                            "Could not set Log3G10 on \(node.ip) (\(reading.parameterID))."
+                        )
+                        return
+                    }
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(
+                            Self.manualTransformSettleSeconds * 1_000_000_000
+                        )
+                    )
+                    guard !manualEndRequested else {
+                        await closeManualMatch()
+                        return
+                    }
+                }
+                // Whether newly changed or already Log3G10, only measurements
+                // after all transform reads/settling may enter this baseline.
+                baselineEpoch = Date()
+            }
+
+            manualStatus =
+                "\(node.displayName): capturing post-transform baseline \(index + 1)/\(ordered.count)…"
+            guard let samples = await collectManualSamples(
+                node,
+                after: baselineEpoch,
+                count: 3,
+                timeout: Self.manualReadyGrace
+            ),
+                  let baseline = median(samples) else {
+                if manualEndRequested {
+                    await closeManualMatch()
+                } else {
+                    await failManualMatch(
+                        "Could not capture a fresh locked-sphere baseline on \(node.displayName)."
+                    )
+                }
+                return
+            }
+            if let qualityFailure = manualQualityInvariantFailure(
+                parts,
+                expected: verifiedQuality
+            ) {
+                await failManualMatch("Measurement stopped: \(qualityFailure)")
+                return
+            }
+            baselines[node.id] = baseline
+            manualRecentIRE[node.id] = Array(samples.suffix(3))
+            manualLastMeasurementAt[node.id] = node.sphere.measuredAt
+            node.manualMatch.baselineIRE = baseline
+            node.manualMatch.currentIRE = baseline
+            node.manualMatch.detail = "post-transform baseline captured"
+            let visibleFor = Date().timeIntervalSince(visualVerificationStarted)
+            if visibleFor < Self.manualVisualVerificationSeconds {
+                let remaining = Self.manualVisualVerificationSeconds - visibleFor
+                try? await Task.sleep(
+                    nanoseconds: UInt64(remaining * 1_000_000_000)
+                )
+            }
+            // The tile retains this fresh post-transform frame for visual review.
+            transitionManualStreamRole(node, to: .parked, now: Date())
         }
         guard !manualEndRequested else { await closeManualMatch(); return }
+        // Every participant's mirrored output was successfully read and
+        // verified at this point. Only now is it safe for closeManualMatch() to
+        // report "already Log3G10" when no camera actually required a SET.
+        manualEnteredTransformStage = manualTransform.isLog3G10
 
         let rawTarget: Double
         switch manualTargetMode {
@@ -1100,6 +1467,7 @@ final class ArrayController: ObservableObject {
                 detail: "fixed target captured")
         }
         manualPhase = .trimming
+        fullScreenNodeID = nil
         manualStatus = String(format: "Target locked at %.0f IRE — select a camera and trim its lens.", target)
         log(String(format: "manual match: START — %d cameras, fixed target %.2f IRE, tolerance ±%.3f stop, hold %.1fs",
                    parts.count, target, manualToleranceStops, manualHoldSeconds))
@@ -1114,46 +1482,83 @@ final class ArrayController: ObservableObject {
         await closeManualMatch()
     }
 
-    /// A short rolling capture makes the fixed baseline resistant to one JPEG
-    /// or detector outlier without pretending the independent streams are
-    /// frame-synchronous.
-    private func captureManualBaselines(_ parts: [CameraNode]) async -> [UUID: Double]? {
-        var samples: [UUID: [Double]] = [:]
-        var lastSeen: [UUID: Date] = [:]
-        // Collect at least two fresh samples per camera. Exit as soon as every
-        // camera has enough (normally well under a second), but keep waiting up to
-        // a longer bound so one camera briefly mid-restart — the same bench
-        // stream-flap that used to block the capture entirely — doesn't fail the
-        // whole array. Only a camera that never recovers within the bound aborts.
-        let enough = { (id: UUID) in (samples[id]?.count ?? 0) >= 2 }
-        let deadline = Date().addingTimeInterval(Self.manualReadyGrace)
-        while Date() < deadline, !manualEndRequested {
-            for node in parts {
-                guard node.sphere.phase == .locked,
-                      let ire = node.sphere.heroIRE,
-                      let measuredAt = node.sphere.measuredAt,
-                      lastSeen[node.id] != measuredAt else { continue }
-                samples[node.id, default: []].append(ire)
-                lastSeen[node.id] = measuredAt
-            }
-            if parts.allSatisfy({ enough($0.id) }) { break }
-            try? await Task.sleep(nanoseconds: 100_000_000)
+    private func manualQualityInvariantFailure(
+        _ parts: [CameraNode],
+        expected: Int
+    ) -> String? {
+        guard arrayActualQuality == expected else {
+            return "participant quality proof was invalidated; re-verify the array."
         }
-        guard !manualEndRequested,
-              parts.allSatisfy({ enough($0.id) }) else { return nil }
+        if let changed = parts.first(where: {
+            $0.status.livestreamQuality != expected
+        }) {
+            let actual = changed.status.livestreamQuality
+                .flatMap { RCP2.livestreamQualityLabels[$0] } ?? "NO READ-BACK"
+            return "\(manualIDKey(changed)) changed livestream quality to \(actual)."
+        }
+        return nil
+    }
 
-        var result: [UUID: Double] = [:]
-        for node in parts {
-            guard let values = samples[node.id], let value = median(values) else { return nil }
-            result[node.id] = value
-            manualRecentIRE[node.id] = Array(values.suffix(5))
-            manualLastMeasurementAt[node.id] = lastSeen[node.id]
+    /// Wait for a locally-woken camera to prove the full measurement path: live
+    /// HTTP transport plus three new native-frame ROI readings. A cached sphere
+    /// value from the solve pass cannot satisfy this gate.
+    private func waitForManualCameraReady(
+        _ node: CameraNode,
+        after epoch: Date
+    ) async -> Bool {
+        guard let samples = await collectManualSamples(
+            node,
+            after: epoch,
+            count: 3,
+            timeout: Self.manualReadyGrace
+        ) else {
+            return false
         }
-        return result
+        manualRecentIRE[node.id] = samples
+        manualLastMeasurementAt[node.id] = node.sphere.measuredAt
+        return !node.streamRecovering
+            && node.stream.stats.width == NativeIREProbe.requiredSourceWidth
+            && node.stream.stats.height == NativeIREProbe.requiredSourceHeight
+    }
+
+    /// Collect unique native-ROI measurements newer than `epoch`. The short
+    /// rolling median rejects an isolated JPEG outlier without implying that
+    /// independent cameras are frame-synchronous.
+    private func collectManualSamples(
+        _ node: CameraNode,
+        after epoch: Date,
+        count: Int,
+        timeout: TimeInterval
+    ) async -> [Double]? {
+        let deadline = Date().addingTimeInterval(timeout)
+        var samples: [Double] = []
+        var lastSeen: Date?
+        while Date() < deadline, !manualEndRequested, !Task.isCancelled {
+            if node.stream.isStreaming,
+               (node.sphere.phase == .locked || node.sphere.phase == .coasting),
+               let measuredAt = node.sphere.measuredAt,
+               measuredAt > epoch,
+               measuredAt != lastSeen,
+               let ire = node.sphere.heroIRE {
+                samples.append(ire)
+                lastSeen = measuredAt
+                if samples.count >= count { return samples }
+            }
+            try? await Task.sleep(nanoseconds: 40_000_000)
+        }
+        return nil
     }
 
     private func updateManualMatch(_ parts: [CameraNode]) {
         guard let target = manualTargetIRE else { return }
+        guard manualPhase == .trimming else {
+            if manualPhase == .complete {
+                for node in parts where node.streamRole != .parked {
+                    node.setStreamRole(.parked)
+                }
+            }
+            return
+        }
         let now = Date()
 
         // Catch a camera-side or restart read-back that diverges after
@@ -1191,17 +1596,65 @@ final class ArrayController: ObservableObject {
             return
         }
 
-        // Only the fullscreen-focused camera runs the ~14 Hz frozen fast path.
-        // Livestream quality remains identical across every participant; focus
-        // may change analysis cadence, never the camera's JPEG quality factor.
-        for node in parts { node.focusedTrim = (node.id == fullScreenNodeID) }
+        // At most two local readers are open while trimming: the camera under
+        // the operator's hand plus the next uncertified camera warming for a
+        // quick handoff. Every other camera-side encoder and RCP session remains
+        // untouched while its local HTTP reader is intentionally parked.
+        applyManualStreamSchedule(parts)
+
+        guard let focusID = fullScreenNodeID,
+              let focused = parts.first(where: { $0.id == focusID }) else {
+            manualMatchedCount = manualCertified.count
+            manualCommonDriftStops = nil
+            updateManualArraySpread(parts)
+            manualStatus = String(
+                format: "%d/%d certified — select a camera to begin aperture matching.",
+                manualMatchedCount,
+                manualParticipantCount
+            )
+            return
+        }
+
+        var focusJustCertified = false
 
         for node in parts {
+            if node.streamRole == .parked {
+                manualStableSince.removeValue(forKey: node.id)
+                if manualCertified.contains(node.id) {
+                    node.manualMatch.phase = .matched
+                    node.manualMatch.stability = 1
+                    node.manualMatch.detail = "certified; local stream parked"
+                } else {
+                    node.manualMatch.phase = .acquiring
+                    node.manualMatch.stability = 0
+                    node.manualMatch.detail = "waiting for operator focus"
+                }
+                continue
+            }
+
+            let frameTimeout = node.streamRole == .focused
+                ? Self.focusedStreamStallTimeout
+                : Self.warmStreamStallTimeout
+            let transportFresh = node.connected
+                && node.stream.isStreaming
+                && node.stream.stats.lastFrameAt.map {
+                    now.timeIntervalSince($0) <= frameTimeout
+                } == true
+
+            var measurementAdvanced = false
+            var measurementGap: TimeInterval?
             let measurementFresh: Bool
             if let measuredAt = node.sphere.measuredAt {
-                measurementFresh = now.timeIntervalSince(measuredAt) <= 1.5
+                let measurementTimeout = node.streamRole == .focused
+                    ? Self.focusedMeasurementContinuity
+                    : 1.5
+                measurementFresh = now.timeIntervalSince(measuredAt) <= measurementTimeout
                 if measurementFresh, measuredAt != manualLastMeasurementAt[node.id],
                    let ire = node.sphere.heroIRE {
+                    measurementAdvanced = true
+                    measurementGap = manualLastMeasurementAt[node.id].map {
+                        measuredAt.timeIntervalSince($0)
+                    }
                     var values = manualRecentIRE[node.id, default: []]
                     values.append(ire)
                     // The camera a hand is actively on (fullscreen focus) uses a
@@ -1218,26 +1671,60 @@ final class ArrayController: ObservableObject {
                 measurementFresh = false
             }
 
-            guard node.connected, node.stream.isStreaming,
-                  node.sphere.phase == .locked, measurementFresh,
+            let sphereFresh = (node.sphere.phase == .locked || node.sphere.phase == .coasting)
+                && measurementFresh
+
+            guard transportFresh, sphereFresh, !node.streamRecovering,
                   let current = median(manualRecentIRE[node.id] ?? []),
                   let baseline = node.manualMatch.baselineIRE else {
                 manualStableSince.removeValue(forKey: node.id)
-                node.manualMatch.phase = .unavailable
                 node.manualMatch.stability = 0
-                node.manualMatch.detail = "sphere lock or fresh stream measurement lost"
+                if node.streamRole == .focused {
+                    invalidateManualCertificationQualityProof()
+                    manualCertified.remove(node.id)
+                    node.manualMatch.phase = .recovering
+                    node.manualMatch.currentIRE = nil
+                    node.manualMatch.correctionStops = nil
+                    node.manualMatch.deltaIRE = nil
+                    node.manualMatch.detail = transportFresh
+                        ? "waiting for three fresh native ROI measurements"
+                        : "reopening focused local stream"
+                    if !transportFresh {
+                        requestStreamRecovery(node, now: now)
+                    }
+                } else {
+                    node.manualMatch.phase = .acquiring
+                    node.manualMatch.currentIRE = nil
+                    node.manualMatch.correctionStops = nil
+                    node.manualMatch.deltaIRE = nil
+                    node.manualMatch.detail = transportFresh
+                        ? "warming native ROI measurements"
+                        : "warming next local stream"
+                    if !transportFresh {
+                        requestStreamRecovery(node, now: now)
+                    }
+                }
                 continue
             }
 
             let correction = Log3G10.stops(between: target, and: current)
             guard correction.isFinite else {
                 manualStableSince.removeValue(forKey: node.id)
+                if node.id == focused.id {
+                    invalidateManualCertificationQualityProof()
+                }
+                if manualCertified.remove(node.id) != nil {
+                    log("manual match: \(manualIDKey(node)) certification withdrawn — invalid Log3G10 measurement")
+                }
+                node.manualMatch.currentIRE = nil
+                node.manualMatch.correctionStops = nil
+                node.manualMatch.deltaIRE = nil
+                node.manualMatch.stability = 0
                 node.manualMatch.phase = .unavailable
                 node.manualMatch.detail = "invalid Log3G10 measurement"
                 continue
             }
 
-            let wasMatched = node.manualMatch.phase == .matched
             node.manualMatch.currentIRE = current
             node.manualMatch.targetIRE = target
             node.manualMatch.correctionStops = correction
@@ -1245,7 +1732,36 @@ final class ArrayController: ObservableObject {
             node.manualMatch.baselineIRE = baseline
             node.manualMatch.toleranceStops = manualToleranceStops
 
+            // A warm camera proves the next HTTP/native-measurement path is
+            // ready, but it cannot earn calibration while nobody is watching or
+            // touching its lens. Only fullscreen focus accrues the hold.
+            guard node.id == focused.id else {
+                manualStableSince.removeValue(forKey: node.id)
+                node.manualMatch.stability = 0
+                node.manualMatch.phase = .acquiring
+                node.manualMatch.detail = abs(correction) <= manualToleranceStops
+                    ? "next camera ready; focus required to certify"
+                    : "next camera stream warm"
+                continue
+            }
+
             if abs(correction) <= manualToleranceStops {
+                // Certification time advances only when a new native ROI
+                // measurement arrives. A stalled image therefore freezes, then
+                // resets, the hold instead of letting wall-clock time complete it.
+                guard measurementAdvanced else {
+                    if manualStableSince[node.id] == nil {
+                        node.manualMatch.stability = 0
+                        node.manualMatch.phase = .acquiring
+                        node.manualMatch.detail = "waiting for the next focused measurement"
+                    }
+                    continue
+                }
+                if let measurementGap,
+                   measurementGap > Self.focusedMeasurementContinuity {
+                    manualStableSince.removeValue(forKey: node.id)
+                    node.manualMatch.stability = 0
+                }
                 let since = manualStableSince[node.id] ?? now
                 manualStableSince[node.id] = since
                 let progress = min(1, now.timeIntervalSince(since) / max(0.1, manualHoldSeconds))
@@ -1254,14 +1770,31 @@ final class ArrayController: ObservableObject {
                 node.manualMatch.detail = progress >= 1
                     ? "stable inside tolerance"
                     : String(format: "hold steady %.1fs", max(0, manualHoldSeconds - now.timeIntervalSince(since)))
-            } else if wasMatched && abs(correction) <= manualToleranceStops * 1.25 {
-                // Small hysteresis prevents a certified camera flickering at
-                // the exact tolerance boundary; array verification still uses
-                // the strict tolerance below.
-                node.manualMatch.stability = 1
-                node.manualMatch.phase = .matched
-                node.manualMatch.detail = "matched (edge hysteresis)"
+                if progress >= 1, !manualCertified.contains(node.id) {
+                    if manualCertificationQualityApprovedID == node.id {
+                        manualCertified.insert(node.id)
+                        focusJustCertified = true
+                        log("manual match: \(manualIDKey(node)) certified after \(String(format: "%.1f", manualHoldSeconds))s focused hold")
+                        soak.recordMatchEvent(
+                            "manual_camera_certified",
+                            cameraIP: node.ip,
+                            finalSpreadStops: manualArraySpreadStops,
+                            detail: String(format: "correction %+.3f stop", correction)
+                        )
+                    } else {
+                        node.manualMatch.phase = .hold
+                        node.manualMatch.detail = "verifying actual stream quality"
+                        requestManualCertificationQualityProof(
+                            for: node,
+                            expected: expected
+                        )
+                    }
+                }
             } else {
+                invalidateManualCertificationQualityProof()
+                if manualCertified.remove(node.id) != nil {
+                    log("manual match: \(manualIDKey(node)) certification withdrawn before proceed")
+                }
                 manualStableSince.removeValue(forKey: node.id)
                 node.manualMatch.stability = 0
                 node.manualMatch.phase = correction > 0 ? .open : .close
@@ -1271,103 +1804,320 @@ final class ArrayController: ObservableObject {
             }
         }
 
-        manualMatchedCount = parts.filter { $0.manualMatch.phase == .matched }.count
+        manualMatchedCount = manualCertified.count
+        manualCommonDriftStops = nil
+        updateManualArraySpread(parts)
 
-        // --- Guided auto-advance (single operator, fullscreen) ---
-        // A camera is "certified" once it holds a match. If a certified camera
-        // later leaves tolerance (phase OPEN/CLOSE/NO SIGNAL — i.e. past the
-        // matched hysteresis), snap focus back to the earliest such camera.
-        // Otherwise, once the focused camera is certified, jump to the next
-        // uncertified, available camera in ID order.
-        if manualGuidedAdvance, manualSessionActive, fullScreenNodeID != nil {
-            var justDrifted: [CameraNode] = []
-            for node in parts {
-                if node.manualMatch.phase == .matched {
-                    manualCertified.insert(node.id)
-                } else if manualCertified.contains(node.id),
-                          node.manualMatch.phase == .open
-                            || node.manualMatch.phase == .close
-                            || node.manualMatch.phase == .unavailable {
-                    manualCertified.remove(node.id)
-                    justDrifted.append(node)
-                }
-            }
-            let ordered = parts.sorted { manualIDKey($0) < manualIDKey($1) }
+        if focusJustCertified, manualAdvanceMode == .automatic {
+            proceedManualMatch()
+            return
+        }
 
-            // Dwell: track how long the focused camera has held an unbroken match.
-            let focus = parts.first(where: { $0.id == fullScreenNodeID })
-            if focus?.manualMatch.phase == .matched {
-                if manualFocusDwellSince == nil { manualFocusDwellSince = now }
+        switch focused.manualMatch.phase {
+        case .recovering:
+            manualStatus = "\(manualIDKey(focused)): HOLD - RECOVERING"
+        case .matched:
+            if manualCertificationQualityTask != nil {
+                manualStatus =
+                    "\(manualIDKey(focused)): verifying actual livestream quality before proceed…"
             } else {
-                manualFocusDwellSince = nil
+                manualStatus = manualAdvanceMode == .operatorProceed
+                    ? "\(manualIDKey(focused)) certified — proceed when ready."
+                    : "\(manualIDKey(focused)) certified."
             }
-            let dwellMet = manualFocusDwellSince
-                .map { now.timeIntervalSince($0) >= manualAdvanceDwellSeconds } ?? false
+        case .hold:
+            if focused.manualMatch.stability >= 1,
+               manualCertificationQualityTask != nil {
+                manualStatus =
+                    "\(manualIDKey(focused)): verifying final actual livestream quality…"
+            } else {
+                manualStatus = String(
+                    format: "%d/%d certified — %@: hold steady %.1fs.",
+                    manualMatchedCount,
+                    manualParticipantCount,
+                    manualIDKey(focused),
+                    max(0, manualHoldSeconds * (1 - focused.manualMatch.stability))
+                )
+            }
+        case .open, .close:
+            manualStatus = String(
+                format: "%d/%d certified — %@: %@.",
+                manualMatchedCount,
+                manualParticipantCount,
+                manualIDKey(focused),
+                focused.manualMatch.detail
+            )
+        case .acquiring:
+            manualStatus = "\(manualIDKey(focused)): acquiring fresh native ROI measurements…"
+        case .idle, .unavailable:
+            manualStatus = "\(manualIDKey(focused)): waiting for a usable focused stream…"
+        }
+    }
 
-            if let drifted = justDrifted.min(by: { manualIDKey($0) < manualIDKey($1) }) {
-                // Snap-back is immediate — a certified camera that slipped needs
-                // attention now, regardless of the forward dwell.
-                focusManual(on: drifted)
-            } else if let focus, manualCertified.contains(focus.id), dwellMet,
-                      let next = ordered.first(where: {
-                          !manualCertified.contains($0.id) && $0.manualMatch.phase != .unavailable
-                      }) {
-                focusManual(on: next)
+    /// Apply the local-resource policy for the trimming stage. Role changes from
+    /// parked → warm/focused are HTTP-only and deliberately invalidate cached
+    /// rolling samples so guidance cannot resume on a pre-park value.
+    private func applyManualStreamSchedule(_ parts: [CameraNode]) {
+        guard manualPhase == .trimming else { return }
+        let focused = fullScreenNodeID.flatMap { id in
+            parts.first(where: { $0.id == id })
+        }
+        let warm = focused.flatMap {
+            nextUncertifiedManualCamera(after: $0, in: parts)
+        }
+        let now = Date()
+        var desiredRoles: [UUID: CameraNode.StreamRole] = [:]
+        for node in parts {
+            if node.id == focused?.id {
+                desiredRoles[node.id] = .focused
+            } else if node.id == warm?.id {
+                desiredRoles[node.id] = .warm
+            } else {
+                desiredRoles[node.id] = .parked
             }
         }
 
-        let liveIRE = parts.compactMap { $0.manualMatch.currentIRE }.sorted()
-        if let lo = liveIRE.first, let hi = liveIRE.last, liveIRE.count >= 2 {
+        // Shed the previous focus first, then promote/wake. This keeps the hard
+        // local-reader ceiling at two even during the handoff itself.
+        for node in parts where desiredRoles[node.id] == .parked {
+            transitionManualStreamRole(node, to: .parked, now: now)
+        }
+        for node in parts {
+            guard let role = desiredRoles[node.id], role != .parked else { continue }
+            transitionManualStreamRole(node, to: role, now: now)
+        }
+    }
+
+    private func transitionManualStreamRole(
+        _ node: CameraNode,
+        to desiredRole: CameraNode.StreamRole,
+        now: Date
+    ) {
+        guard node.streamRole != desiredRole else { return }
+        if desiredRole == .focused
+            || (node.streamRole == .focused && desiredRole != .focused) {
+            invalidateManualCertificationQualityProof()
+        }
+        if desiredRole == .focused,
+           manualCertified.remove(node.id) != nil {
+            manualMatchedCount = manualCertified.count
+            manualStableSince.removeValue(forKey: node.id)
+            node.manualMatch.phase = .acquiring
+            node.manualMatch.stability = 0
+            node.manualMatch.detail = "operator revisit — focused revalidation required"
+            log("manual match: \(manualIDKey(node)) reopened for focused revalidation")
+        }
+        let wasParked = node.streamRole == .parked
+        if desiredRole == .parked {
+            manualStableSince.removeValue(forKey: node.id)
+            streamRetryCount.removeValue(forKey: node.id)
+            streamLastRetryAt.removeValue(forKey: node.id)
+        } else if wasParked {
+            manualRecentIRE[node.id] = []
+            manualLastMeasurementAt.removeValue(forKey: node.id)
+            // CameraNode performs wake attempt 1. Seed the shared retry gate so
+            // the watchdog/guidance loop cannot immediately duplicate it.
+            streamRetryCount[node.id] = 1
+            streamLastRetryAt[node.id] = now
+        }
+        node.setStreamRole(desiredRole)
+    }
+
+    private func updateManualArraySpread(_ parts: [CameraNode]) {
+        let latestKnownIRE = parts.compactMap { $0.manualMatch.currentIRE }.sorted()
+        if let lo = latestKnownIRE.first, let hi = latestKnownIRE.last,
+           latestKnownIRE.count >= 2 {
             let spread = abs(Log3G10.stops(between: lo, and: hi))
             manualArraySpreadStops = spread.isFinite ? spread : nil
         } else {
             manualArraySpreadStops = nil
         }
+    }
 
-        updateManualDrift(parts)
-        let unavailable = parts.filter { $0.manualMatch.phase == .unavailable }
-        let allStrictlyInside = parts.allSatisfy { node in
-            guard node.manualMatch.phase != .unavailable,
-                  let correction = node.manualMatch.correctionStops else { return false }
-            return abs(correction) <= manualToleranceStops
+    private func invalidateManualCertificationQualityProof() {
+        guard manualCertificationQualityTask != nil
+                || manualCertificationQualityApprovedID != nil else {
+            return
         }
+        manualCertificationQualityGeneration &+= 1
+        manualCertificationQualityTask?.cancel()
+        manualCertificationQualityTask = nil
+        manualCertificationQualityApprovedID = nil
+    }
 
-        if allStrictlyInside, manualCommonDriftStops == nil {
-            let since = manualArrayStableSince ?? now
-            manualArrayStableSince = since
-            if now.timeIntervalSince(since) >= manualHoldSeconds {
-                if manualPhase != .complete {
-                    manualPhase = .complete
-                    // Whole array is calibrated — drop out of the single-camera
-                    // fullscreen feed back to the multiview so the operator sees
-                    // every tile verified at once (and guided auto-advance, which
-                    // only runs while fullscreen, naturally stops).
-                    fullScreenNodeID = nil
-                    manualStatus = "Array verified simultaneously — Finish & Restore when ready."
-                    log("manual match: VERIFY PASS — every participant held the fixed target")
-                    soak.recordMatchEvent("manual_match_verified",
-                                          finalSpreadStops: manualArraySpreadStops,
-                                          detail: "all cameras inside tolerance")
-                }
-            } else if manualPhase != .complete {
-                manualStatus = String(format: "All cameras in target — hold %.1fs for array verification.",
-                                      max(0, manualHoldSeconds - now.timeIntervalSince(since)))
+    /// Final, read-only focused-camera quality proof. RCP2 does not advertise
+    /// explicit subscription support for LIVESTREAM_QUALITY, so this uses the
+    /// documented rcp_get path and CameraActor removes the implicit subscription
+    /// residue immediately afterward.
+    private func requestManualCertificationQualityProof(
+        for node: CameraNode,
+        expected: Int
+    ) {
+        guard manualCertificationQualityApprovedID != node.id,
+              manualCertificationQualityTask == nil,
+              let camera = node.camera else {
+            return
+        }
+        manualCertificationQualityGeneration &+= 1
+        let generation = manualCertificationQualityGeneration
+        let nodeID = node.id
+        let nodeName = manualIDKey(node)
+        manualCertificationQualityTask = Task { [weak self] in
+            let actual = await camera.readLivestreamQuality()
+            guard let self, !Task.isCancelled,
+                  self.manualCertificationQualityGeneration == generation,
+                  self.manualPhase == .trimming,
+                  self.fullScreenNodeID == nodeID else {
+                return
             }
+            self.manualCertificationQualityTask = nil
+            guard actual == expected else {
+                let actualLabel = actual
+                    .flatMap { RCP2.livestreamQualityLabels[$0] } ?? "NO READ-BACK"
+                self.manualCertificationQualityApprovedID = nil
+                self.manualEndWasFailure = true
+                self.manualEndMessage =
+                    "Measurement stopped: \(nodeName) returned \(actualLabel) at certification."
+                self.manualEndRequested = true
+                self.log("manual match: quality invariant LOST — \(self.manualEndMessage)")
+                return
+            }
+            self.manualCertificationQualityApprovedID = nodeID
+            self.log("manual match: \(nodeName) final actual livestream quality confirmed")
+        }
+    }
+
+    /// UI gate for the explicit Operator Proceed mode. The four-second hold is
+    /// necessary but not sufficient: the focused stream must still be fresh at
+    /// the instant the operator approves the handoff.
+    func canProceedManualMatch(from node: CameraNode) -> Bool {
+        guard manualPhase == .trimming,
+              fullScreenNodeID == node.id,
+              manualCertified.contains(node.id),
+              manualCertificationQualityApprovedID == node.id,
+              manualCertificationQualityTask == nil,
+              let expected = manualExpectedQuality,
+              arrayActualQuality == expected,
+              manualParticipants.allSatisfy({
+                  $0.status.livestreamQuality == expected
+              }),
+              node.manualMatch.phase == .matched,
+              node.streamRole == .focused,
+              !node.streamRecovering,
+              node.stream.isStreaming,
+              let frameAt = node.stream.stats.lastFrameAt,
+              Date().timeIntervalSince(frameAt) <= Self.focusedStreamStallTimeout,
+              let measuredAt = node.sphere.measuredAt,
+              Date().timeIntervalSince(measuredAt) <= Self.focusedMeasurementContinuity else {
+            return false
+        }
+        return true
+    }
+
+    func manualProceedTitle(from node: CameraNode) -> String {
+        nextUncertifiedManualCamera(after: node, in: manualParticipants)
+            .map { "Proceed to \(manualIDKey($0))" }
+            ?? "Complete Calibration"
+    }
+
+    /// Shared handoff used by both Automatic and Operator Proceed. Automatic
+    /// invokes it immediately after the same four-second certification that
+    /// enables the operator's button.
+    func proceedManualMatch() {
+        guard manualPhase == .trimming,
+              let focused = fullScreenNode else {
+            return
+        }
+        if manualAdvanceMode == .operatorProceed {
+            requestOperatorProceedQualityProof(for: focused)
         } else {
-            manualArrayStableSince = nil
-            if manualPhase == .complete {
-                manualPhase = .trimming
-                manualStatus = "Verification reopened — one or more cameras left the target."
-                log("manual match: verification reopened")
-            } else if !unavailable.isEmpty {
-                manualStatus = "SIGNAL LOST — reacquire sphere lock on: \(unavailable.map(\.ip).joined(separator: ", "))."
-            } else if let drift = manualCommonDriftStops {
-                manualStatus = String(format: "GLOBAL LIGHTING DRIFT %+.2f stop — pause trim and inspect the stage.", drift)
-            } else {
-                manualStatus = String(format: "%d/%d matched — trim the selected camera toward the fixed target.",
-                                      manualMatchedCount, manualParticipantCount)
-            }
+            advanceManualMatch(from: focused)
         }
+    }
+
+    /// Operator Proceed may happen long after the four-second hold completed.
+    /// Re-read the focused camera's actual factor at the click instead of
+    /// accepting an arbitrarily old, unsubscribed proof. This is one bounded
+    /// read per handoff—not background polling.
+    private func requestOperatorProceedQualityProof(for node: CameraNode) {
+        guard canProceedManualMatch(from: node),
+              let expected = manualExpectedQuality,
+              let camera = node.camera else {
+            return
+        }
+        manualCertificationQualityGeneration &+= 1
+        let generation = manualCertificationQualityGeneration
+        let nodeID = node.id
+        let nodeName = manualIDKey(node)
+        manualCertificationQualityApprovedID = nil
+        manualStatus =
+            "\(nodeName): verifying actual livestream quality before proceed…"
+        manualCertificationQualityTask = Task { [weak self] in
+            let actual = await camera.readLivestreamQuality()
+            guard let self, !Task.isCancelled,
+                  self.manualCertificationQualityGeneration == generation,
+                  self.manualPhase == .trimming,
+                  self.fullScreenNodeID == nodeID else {
+                return
+            }
+            self.manualCertificationQualityTask = nil
+            guard actual == expected else {
+                let actualLabel = actual
+                    .flatMap { RCP2.livestreamQualityLabels[$0] }
+                    ?? "NO READ-BACK"
+                self.manualEndWasFailure = true
+                self.manualEndMessage =
+                    "Measurement stopped: \(nodeName) returned \(actualLabel) before proceed."
+                self.manualEndRequested = true
+                self.log("manual match: quality invariant LOST — \(self.manualEndMessage)")
+                return
+            }
+            self.manualCertificationQualityApprovedID = nodeID
+            guard let current = self.fullScreenNode,
+                  self.canProceedManualMatch(from: current) else {
+                self.manualStatus =
+                    "\(nodeName): quality confirmed; waiting for a fresh focused measurement…"
+                return
+            }
+            self.log("manual match: \(nodeName) operator-proceed actual quality confirmed")
+            self.advanceManualMatch(from: current)
+        }
+    }
+
+    private func advanceManualMatch(from focused: CameraNode) {
+        guard canProceedManualMatch(from: focused) else { return }
+        if let next = nextUncertifiedManualCamera(
+            after: focused,
+            in: manualParticipants
+        ) {
+            manualStatus = "\(manualIDKey(focused)) certified — warming \(manualIDKey(next))…"
+            focusManual(on: next)
+        } else {
+            completeManualCalibration()
+        }
+    }
+
+    private func completeManualCalibration() {
+        guard manualPhase == .trimming,
+              manualCertified.count == manualParticipantCount else {
+            return
+        }
+        manualMatchedCount = manualCertified.count
+        manualPhase = .complete
+        fullScreenNodeID = nil
+        for node in manualParticipants {
+            node.setStreamRole(.parked)
+            streamRetryCount.removeValue(forKey: node.id)
+            streamLastRetryAt.removeValue(forKey: node.id)
+        }
+        manualStatus =
+            "All \(manualParticipantCount) cameras certified sequentially — Finish & Restore when ready."
+        log("manual match: VERIFY PASS — every participant completed its focused \(String(format: "%.1f", manualHoldSeconds))s hold")
+        soak.recordMatchEvent(
+            "manual_match_verified",
+            finalSpreadStops: manualArraySpreadStops,
+            detail: "all cameras certified sequentially"
+        )
     }
 
     /// Cameras not selected and not yet in their HOLD/MATCHED gate act as
@@ -1405,21 +2155,24 @@ final class ArrayController: ObservableObject {
         manualStatus = "Restoring saved output presets…"
         var restored = 0
         var failed: [String] = []
+        let changed = manualChangedOutputs.count
         for node in nodes where manualChangedOutputs.contains(node.id) {
             guard let camera = node.camera, let saved = manualSavedTransforms[node.id] else {
                 failed.append(node.ip)
                 continue
             }
-            // Restore the exact Look param we swapped (LCD or SDI) to its
-            // saved value — Custom Display / 3D LUT / etc.
-            if await camera.restoreColorSetting(saved) {
+            // Delayed retries are compare-before-set: restore only when the
+            // same mirrored output is still app-owned Log3G10 (or is already at
+            // the saved preset). Never overwrite a newer operator choice.
+            if await camera.restoreMonitorTransform(saved) {
                 restored += 1
+                manualChangedOutputs.remove(node.id)
+                manualSavedTransforms.removeValue(forKey: node.id)
             } else {
                 failed.append(node.ip)
             }
         }
 
-        let changed = manualChangedOutputs.count
         let restoreText: String
         if changed > 0 {
             restoreText = "Restored \(restored)/\(changed) changed output preset(s)."
@@ -1432,9 +2185,18 @@ final class ArrayController: ObservableObject {
             // Log3G10 so it can't read as "outputs are stuck in Log3G10".
             restoreText = "No output presets were changed."
         }
-        let failureText = failed.isEmpty ? "" : " Restore requires attention: \(failed.joined(separator: ", "))."
+        let failureText: String
+        if !failed.isEmpty {
+            failureText =
+                " Restore requires attention: \(failed.joined(separator: ", ")). Reconnect, then retry output restore."
+        } else if manualRestorePending {
+            failureText =
+                " \(manualChangedOutputs.count) output restore(s) remain pending."
+        } else {
+            failureText = ""
+        }
         manualStatus = "\(manualEndMessage) \(restoreText)\(failureText)"
-        manualPhase = (manualEndWasFailure || !failed.isEmpty) ? .failed : .finished
+        manualPhase = (manualEndWasFailure || manualRestorePending) ? .failed : .finished
         log("manual match: END — \(manualStatus)")
         soak.recordMatchEvent("manual_match_end",
                               finalSpreadStops: manualArraySpreadStops,
@@ -1444,14 +2206,28 @@ final class ArrayController: ObservableObject {
         for node in nodes where manualFrozenNodes.contains(node.id) {
             node.unfreezeTransformLock()
         }
-        for node in nodes { node.focusedTrim = false }
+        // Leave Manual Assist participants locally parked after restore. Their
+        // camera-side livestream enable/quality and RCP sessions remain intact;
+        // a later explicit Stream All can wake readers HTTP-only.
+        for node in nodes where manualParticipantIDs.contains(node.id) {
+            node.setStreamRole(.parked)
+            streamRetryCount.removeValue(forKey: node.id)
+            streamLastRetryAt.removeValue(forKey: node.id)
+        }
 
-        manualSavedTransforms.removeAll()
-        manualChangedOutputs.removeAll()
         manualFrozenNodes.removeAll()
         manualCertified.removeAll()
-        manualEnteredTransformStage = false
-        manualFocusDwellSince = nil
+        invalidateManualCertificationQualityProof()
+        if manualChangedOutputs.isEmpty {
+            manualSavedTransforms.removeAll()
+            manualEnteredTransformStage = false
+        } else {
+            manualSavedTransforms = manualSavedTransforms.filter {
+                manualChangedOutputs.contains($0.key)
+            }
+        }
+        manualStableSince.removeAll()
+        manualArrayStableSince = nil
         manualEndRequested = false
         manualEndWasFailure = false
         manualExpectedQuality = nil
@@ -1547,7 +2323,8 @@ final class ArrayController: ObservableObject {
     }
 
     func startMatch() {
-        guard loopTask == nil, manualTask == nil, !manualSessionActive, !qualityControlsLocked else { return }
+        guard loopTask == nil, manualTask == nil, !manualSessionActive,
+              !manualRestorePending, !qualityControlsLocked else { return }
         matchWorkflow = .electronic
         qualityControlsLocked = true
         loopTask = Task { await runMatchLoop() }
@@ -1928,44 +2705,6 @@ final class ArrayController: ObservableObject {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
         return moved.allSatisfy { $0.status.apertureSettled }
-    }
-
-    /// Bounded readiness gate for Manual Assist capture. Instead of rejecting the
-    /// whole array on a single-frame snapshot, poll until every connected camera
-    /// is streaming and holding a measurable sphere lock, or the grace elapses.
-    /// Returns nil when the array is ready (or the operator aborted — the caller
-    /// re-checks `manualEndRequested`), otherwise an operator-facing message
-    /// naming the cameras and the reason each is still not ready. A coasting lock
-    /// counts as ready: the sphere is static and still measured at its ROI, and a
-    /// seeded lock re-reports `.locked` on the very next frame.
-    private func awaitManualReady(_ parts: [CameraNode]) async -> String? {
-        let deadline = Date().addingTimeInterval(Self.manualReadyGrace)
-        var announced = false
-        while !manualEndRequested {
-            let notReady = parts.filter {
-                !$0.stream.isStreaming
-                    || ($0.sphere.phase != .locked && $0.sphere.phase != .coasting)
-                    || $0.sphere.heroIRE == nil
-            }
-            if notReady.isEmpty { return nil }
-            if Date() >= deadline {
-                let detail = notReady.map { node -> String in
-                    let why: String
-                    if !node.stream.isStreaming { why = "no stream" }
-                    else if node.sphere.heroIRE == nil { why = "no sphere measurement" }
-                    else { why = "sphere lock lost" }
-                    return "\(node.ip) (\(why))"
-                }.joined(separator: ", ")
-                return "Cameras not ready for capture after \(Int(Self.manualReadyGrace))s: \(detail). Streams or sphere locks are still settling — let them recover, then try again."
-            }
-            if !announced {
-                announced = true
-                manualStatus = "Waiting for streams and sphere locks to settle…"
-                log("manual match: waiting up to \(Int(Self.manualReadyGrace))s for \(parts.count) camera(s) to be stream-live and sphere-locked before capture")
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        return nil
     }
 
     private func waitFreshMeasurements(_ parts: [CameraNode], after epoch: Date) async -> Bool {

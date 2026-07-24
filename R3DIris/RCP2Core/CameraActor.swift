@@ -602,12 +602,23 @@ actor CameraActor {
             log("restore monitor transform: REFUSED — livestream mirror output changed (saved \(saved.parameterID), active \(current.parameterID.isEmpty ? "unknown" : current.parameterID))")
             return false
         }
-        if current.presetValue == savedValue {
+
+        // DISPLAY_PRESET_* is value-with-target. A delayed restore must inspect
+        // TARGET as well as CUR: immediately after an interrupted Log3G10 SET,
+        // CUR can still equal the saved preset while TARGET is already Log3G10.
+        // Treating CUR alone as "already restored" could strand the camera after
+        // the transition completes.
+        unsubscribed.remove(saved.parameterID)
+        let raw = await benchGet(saved.parameterID)
+        let (cur, target) = RCP2.extractCurTarget(raw)
+        let commanded = target ?? cur ?? RCP2.extractInt(raw)
+        if target == savedValue || (target == nil && commanded == savedValue) {
             log("restore monitor transform: already at saved preset \(savedValue) on \(saved.parameterID)")
             return true
         }
-        guard current.presetValue == RCP2.log3G10DisplayPresetValue else {
-            log("restore monitor transform: REFUSED — active preset changed during Manual Assist")
+        guard commanded == RCP2.log3G10DisplayPresetValue else {
+            let detail = commanded.map(String.init) ?? "no value"
+            log("restore monitor transform: REFUSED — active target changed during Manual Assist (\(detail))")
             return false
         }
         return await setMonitorDisplayPreset(parameterID: saved.parameterID,
