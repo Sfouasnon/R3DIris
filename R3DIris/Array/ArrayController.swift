@@ -109,7 +109,12 @@ final class ArrayController: ObservableObject {
 
     enum MatchWorkflow: String, CaseIterable, Identifiable {
         case electronic = "Electronic"
-        case manual = "Manual Assist"
+        // Hybrid is the operator-in-the-loop session (internally still the
+        // `manual*` machinery): it hand-guides manual glass with OPEN/CLOSE and
+        // lets the operator push any e-iris participant to the shared target with
+        // one command. An all-manual rig behaves exactly like the old Manual
+        // Assist; an all-e-iris rig just gets push buttons instead of hand-trims.
+        case hybrid = "Hybrid"
         var id: String { rawValue }
     }
     @Published var matchWorkflow: MatchWorkflow = .electronic
@@ -301,6 +306,131 @@ final class ArrayController: ObservableObject {
         }
         focusManual(on: node)
     }
+
+    // MARK: - Hybrid e-iris push (operator-approved)
+
+    /// List-step offset that moves this camera's iris toward the captured target,
+    /// in the SAME quarter-stop convention the Electronic loop uses — so a hand on
+    /// the ring and a pushed motor behave identically. nil when there is nothing
+    /// worth sending: no live correction, already inside tolerance, or the move
+    /// rounds below one list step (the granularity floor).
+    private func hybridApertureOffset(for node: CameraNode) -> Int? {
+        guard let correction = node.manualMatch.correctionStops, correction.isFinite,
+              abs(correction) > manualToleranceStops else { return nil }
+        let steps = min(8, max(-8, Int((correction * 4).rounded())))
+        guard steps != 0 else { return nil }
+        return -steps
+    }
+
+    /// Whether the operator can push this camera to the shared target right now:
+    /// an active Hybrid session in trimming/complete, a connected e-iris
+    /// participant with an actor, and a non-trivial correction pending.
+    func canPushHybrid(_ node: CameraNode) -> Bool {
+        manualSessionActive
+            && (manualPhase == .trimming || manualPhase == .complete)
+            && manualParticipantIDs.contains(node.id)
+            && node.connected && node.eIris && node.camera != nil
+            && hybridApertureOffset(for: node) != nil
+    }
+
+    /// Count of e-iris participants the operator could push right now — drives the
+    /// array-wide button's enable state and label.
+    var hybridPushableCount: Int {
+        manualParticipants.filter { canPushHybrid($0) }.count
+    }
+
+    /// Push one e-iris participant one planned step toward the target. Operator-
+    /// approved: nothing here runs on a timer. Re-press after the reading settles
+    /// to converge — the same feedback loop as a hand on a manual ring, and it
+    /// never touches manual glass.
+    func pushHybridAperture(_ node: CameraNode) {
+        guard canPushHybrid(node), let offset = hybridApertureOffset(for: node),
+              let cam = node.camera else { return }
+        log("hybrid: push \(manualIDKey(node)) APERTURE \(offset > 0 ? "+" : "")\(offset) step(s) toward \(manualTargetIRE.map { String(format: "%.0f IRE", $0) } ?? "target")")
+        soak.recordMatchEvent("hybrid_push", cameraIP: node.ip,
+                              detail: "offset \(offset); correction \(node.manualMatch.correctionStops.map { String(format: "%+.2fst", $0) } ?? "n/a")")
+        Task { _ = await cam.nudgeAperture(offset: offset) }
+    }
+
+    /// Array-wide convenience: push every e-iris participant currently out of
+    /// tolerance one step toward the target. Manual glass is never touched.
+    func pushAllHybridApertures() {
+        let targets = manualParticipants.filter { canPushHybrid($0) }
+        guard !targets.isEmpty else {
+            log("hybrid: no e-iris participants need a push")
+            return
+        }
+        log("hybrid: pushing \(targets.count) e-iris body(ies) toward target")
+        for node in targets { pushHybridAperture(node) }
+    }
+
+    /// Accept every connected camera's current auto-detected lock as a durable
+    /// operator seed. This is the "don't lose the solve" action: run it before
+    /// leaving Electronic (or any time), and the locks survive a workflow switch
+    /// and the Log3G10 swap instead of coasting out as fragile auto-locks. A
+    /// camera that already carries an operator seed is left untouched.
+    func seedAllSolved() {
+        var newlySeeded = 0, alreadyDurable = 0, noLock = 0
+        for node in nodes where node.connected {
+            if node.sphere.seeded { alreadyDurable += 1; continue }
+            if node.acceptCurrentMask() != nil { newlySeeded += 1 } else { noLock += 1 }
+        }
+        log("seed all solved: \(newlySeeded) newly seeded, \(alreadyDurable) already durable, \(noLock) with no lock to seed")
+    }
+
+    // MARK: - Electronic manual override (post-match trim)
+
+    /// Whether the operator can apply a manual iris override to this camera right
+    /// now: the Electronic workflow, the loop idle, and a connected e-iris body
+    /// with an actor. Gating to loop-idle means an override can never fight an
+    /// in-flight convergence — it is the deliberate move you make AFTER the
+    /// automated match has landed.
+    func canOverride(_ node: CameraNode) -> Bool {
+        matchWorkflow == .electronic
+            && !loopRunning
+            && !manualSessionActive
+            && node.connected && node.eIris && node.camera != nil
+    }
+
+    /// Manually nudge one e-iris camera a single list step off its matched
+    /// position. `open == true` adds exposure (opens the iris); false removes it
+    /// (closes). The camera is flagged as a manual override so the UI shows it is
+    /// deliberately off the computed match — the loop never auto-undoes it; only
+    /// re-running the match (which resets NodeMatchInfo) clears it.
+    func overrideNudge(_ node: CameraNode, open: Bool) {
+        guard canOverride(node), let cam = node.camera else { return }
+        // An ascending aperture list darkens as it climbs, so opening (more
+        // exposure) steps DOWN the list — the same sign the loop and Hybrid use.
+        let offset = open ? -1 : 1
+        node.match.manualOverride = true
+        node.match.overrideSteps += offset
+        node.match.note = overrideNote(node.match.overrideSteps)
+        log("override: \(manualIDKey(node)) manual \(open ? "OPEN" : "CLOSE") 1 step (net \(node.match.overrideSteps > 0 ? "+" : "")\(node.match.overrideSteps)) — off computed match, will not auto-undo")
+        soak.recordMatchEvent("manual_override", cameraIP: node.ip,
+                              detail: "\(open ? "open" : "close") 1 step; net \(node.match.overrideSteps)")
+        Task { _ = await cam.nudgeAperture(offset: offset) }
+    }
+
+    /// Array-wide manual override — nudge every connected e-iris camera one step
+    /// the same direction (e.g. a DP wants the whole array a hair warmer). Because
+    /// every camera moves equally, a relative-reference match stays matched to
+    /// itself; an absolute-target match is deliberately biased until re-run.
+    func overrideNudgeAll(open: Bool) {
+        let targets = nodes.filter { canOverride($0) }
+        guard !targets.isEmpty else {
+            log("override: no e-iris cameras available to nudge")
+            return
+        }
+        log("override: array-wide manual \(open ? "OPEN" : "CLOSE") 1 step on \(targets.count) e-iris camera(s)")
+        for node in targets { overrideNudge(node, open: open) }
+    }
+
+    private func overrideNote(_ steps: Int) -> String {
+        if steps == 0 { return "manual override (returned to match)" }
+        let dir = steps < 0 ? "open" : "close"
+        return "manual override \(dir) \(abs(steps)) step\(abs(steps) == 1 ? "" : "s")"
+    }
+
     private var manualEndRequested = false
     private var manualEndMessage = "Manual Assist aborted by operator."
     private var manualEndWasFailure = false
@@ -1097,10 +1227,10 @@ final class ArrayController: ObservableObject {
             return
         }
 
-        matchWorkflow = .manual
+        matchWorkflow = .hybrid
         manualEndRequested = false
         manualEndWasFailure = false
-        manualEndMessage = "Manual Assist aborted by operator."
+        manualEndMessage = "Hybrid session aborted by operator."
         manualExpectedQuality = nil
         manualTargetIRE = nil
         manualParticipantCount = 0

@@ -15,6 +15,34 @@ under a new version heading when you tag.
 ## [Unreleased]
 
 ### Added
+- **Manual iris override in Electronic mode.** After the loop drives every lens to
+  the target, the operator can nudge any e-iris body one list step open or closed
+  — per-camera Open/Close in the Match Loop table, or Open all / Close all for a
+  deliberate global bias. It reuses the loop's list-relative step and is only
+  available while the loop is idle, so it can never fight convergence. An override
+  is a deliberate move off the computed match: the loop never auto-undoes it —
+  re-running the match (which resets the per-camera state) is the only thing that
+  clears it. Overridden cameras carry a distinct **MATCHED · OVERRIDE (n open/
+  close)** identifier on the tile chip and in the table, and every override is
+  written to the log and soak record so an intentional bias is never mistaken for
+  a calibration error.
+- **Hybrid workflow replaces Manual Assist — the array is now two modes,
+  Electronic and Hybrid.** Hybrid captures one shared target, hand-guides manual
+  glass with live OPEN / CLOSE, and lets the operator push any e-iris participant
+  toward the target on command (per-camera **PUSH** on each e-iris row and an
+  array-wide **Push N e-iris → target**). The push reuses the Electronic loop's
+  quarter-stop list-relative nudge, so a hand on the ring and a driven motor
+  behave identically; it is operator-approved (never timed) and never sends a
+  command to manual glass. This is the mixed-array case: motorized and manual
+  lenses calibrated in one session instead of picking a single mode. An
+  all-manual rig behaves exactly like the old Manual Assist; an all-e-iris rig
+  gets push buttons instead of hand-trims. Prepare (e-iris gate + stop list) is
+  now available in both modes because Hybrid needs it to know which bodies it can
+  drive.
+- **"Seed all solved"** locks every camera's current auto-detected sphere as a
+  durable operator seed in one click. Auto-detected locks are transient and can
+  coast out across a workflow switch or the Log3G10 swap; running this before
+  leaving Electronic keeps the solve so switching into Hybrid never loses it.
 - **Freshest frame** mode in the match panel decodes only the newest livestream
   frame when frames back up and is enabled by default.
 - **Bench IRE validation** captures 300 untouched port-9090 JPEGs per trial for

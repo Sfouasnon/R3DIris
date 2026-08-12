@@ -737,6 +737,15 @@ struct NodeMatchInfo: Sendable, Equatable {
     var directionFlipped: Bool = false
     var note: String = ""
 
+    /// Operator applied a manual iris override to this camera AFTER the automated
+    /// match (Electronic mode). This is a deliberate move off the computed match:
+    /// the loop never auto-undoes it — only re-running the loop on this camera
+    /// clears it. `overrideSteps` is the net list-step offset the operator has
+    /// dialed in beyond the matched position (positive = closed further, negative
+    /// = opened further) so the badge can show the direction and amount.
+    var manualOverride: Bool = false
+    var overrideSteps: Int = 0
+
     /// Residual expressed in (display-referred!) stops for the exposureAdjust
     /// spill (handoff §7 hybrid). log2 of the IRE ratio — an estimate only;
     /// R3DMatch owns the scene-linear truth.

@@ -254,7 +254,7 @@ struct CameraTile: View {
                         .font(.system(size: 11))
                         .foregroundStyle(Theme.ink3)
                 }
-                if array.matchWorkflow == .manual, array.manualSessionActive,
+                if array.matchWorkflow == .hybrid, array.manualSessionActive,
                    node.manualMatch.phase != .idle {
                     ManualCameraHUD(info: node.manualMatch, selected: selected)
                         .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSm))
@@ -467,7 +467,7 @@ struct CameraTile: View {
 
     @ViewBuilder
     var matchChip: some View {
-        if array.matchWorkflow == .manual, array.manualSessionActive,
+        if array.matchWorkflow == .hybrid, array.manualSessionActive,
            node.manualMatch.phase != .idle {
             Text(manualMatchLabel)
                 .font(Theme.mono(10, weight: .semibold))
@@ -475,7 +475,7 @@ struct CameraTile: View {
                 .background(Capsule().fill(manualMatchBG))
                 .foregroundStyle(manualMatchInk)
                 .help(node.manualMatch.detail)
-        } else if node.match.phase != .idle {
+        } else if node.match.phase != .idle || node.match.manualOverride {
             Text(matchLabel)
                 .font(Theme.mono(10, weight: .semibold))
                 .padding(.horizontal, 6).padding(.vertical, 3)
@@ -515,6 +515,15 @@ struct CameraTile: View {
     }
 
     var matchLabel: String {
+        // A manually-overridden camera reads e.g. "MATCHED · OVERRIDE 1 close" so
+        // the operator can see at a glance it was deliberately moved off the
+        // computed match, and which way.
+        if node.match.manualOverride {
+            let n = node.match.overrideSteps
+            let tail = n == 0 ? "" : (n < 0 ? " \(abs(n)) open" : " \(abs(n)) close")
+            let base = node.match.phase == .idle ? "SET" : node.match.phase.rawValue.uppercased()
+            return "\(base) · OVERRIDE\(tail)"
+        }
         if array.loopUsesLog3G10, let d = node.match.deltaStops {
             return String(format: "%@ %+.3fst", node.match.phase.rawValue, d)
         }
@@ -525,6 +534,7 @@ struct CameraTile: View {
     }
 
     var matchBG: Color {
+        if node.match.manualOverride { return Theme.accentBG }
         switch node.match.phase {
         case .matched: return Theme.goodBG
         case .adjusting: return Theme.accentBG
@@ -535,6 +545,7 @@ struct CameraTile: View {
     }
 
     var matchInk: Color {
+        if node.match.manualOverride { return Theme.accent }
         switch node.match.phase {
         case .matched: return Theme.good
         case .adjusting: return Theme.accent
@@ -1407,13 +1418,12 @@ struct ArrayActionsPanel: View {
             .toggleStyle(.switch)
             .tint(Theme.accent)
             .help("For cameras you leave un-seeded, logs why auto-detect did or didn't latch: candidate count, support, and each gate's value. Throttled to ~1.5s per camera.")
-            if array.matchWorkflow == .electronic {
-                Button("Prepare — e-iris gate + AE check + subscribe") { array.prepareAll() }
-                    .buttonStyle(DarkButtonStyle())
-                    .disabled(array.manualSessionActive)
-                    .help("Per body: APERTURE_CONTROL gate, AE warning, valid stop list, APERTURE subscription for the settle detector. One deliberate operator action — rule 11.")
-            } else {
-                Text("Manual Assist uses live sphere measurements only; it does not query, subscribe, or drive APERTURE.")
+            Button("Prepare — e-iris gate + AE check + subscribe") { array.prepareAll() }
+                .buttonStyle(DarkButtonStyle())
+                .disabled(array.manualSessionActive)
+                .help("Per body: APERTURE_CONTROL gate, AE warning, valid stop list, APERTURE subscription for the settle detector. Identifies which bodies are e-iris — required before Hybrid can push them. One deliberate operator action — rule 11.")
+            if array.matchWorkflow == .hybrid {
+                Text("Hybrid drives APERTURE only on e-iris bodies you explicitly push to target; manual glass is hand-guided with OPEN / CLOSE and never receives a command.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(Theme.ink3)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1481,11 +1491,16 @@ struct MatchWorkflowPanel: View {
             .disabled(array.workflowBusy)
 
             Text(array.matchWorkflow == .electronic
-                 ? "Electronic drives supported irises over RCP2 and verifies settle after each move."
-                 : "Manual Assist captures a fixed IRE target and gives live OPEN / CLOSE guidance. It never sends an aperture command.")
+                 ? "Electronic drives every supported iris over RCP2 automatically and verifies settle after each move — best for an all-motorized array."
+                 : "Hybrid captures one shared target, hand-guides manual glass with live OPEN / CLOSE, and lets you push any e-iris body to target on command. Mixed rigs welcome.")
                 .font(.system(size: 10.5))
                 .foregroundStyle(Theme.ink3)
                 .fixedSize(horizontal: false, vertical: true)
+
+            Button("Seed all solved") { array.seedAllSolved() }
+                .buttonStyle(DarkButtonStyle())
+                .disabled(array.manualSessionActive || array.nodes.isEmpty)
+                .help("Lock every camera's current auto-detected sphere as a durable operator seed so the solve survives a workflow switch and the Log3G10 swap. Run this before leaving Electronic so you never lose the solve on the way into Hybrid.")
         }
         .panelCard()
     }
@@ -1498,12 +1513,12 @@ struct ManualAssistPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
-            GroupHeader(title: "Manual Assist",
+            GroupHeader(title: "Hybrid",
                         count: manualCount,
                         warn: array.manualSessionActive,
                         danger: array.manualPhase == .failed)
 
-            Text("Captures a fixed target from stable sphere measurements, temporarily normalizes mirrored outputs to Log3G10, and restores their saved presets on Finish or Abort.")
+            Text("Captures one shared target from stable sphere measurements, temporarily normalizes mirrored outputs to Log3G10, and restores their saved presets on Finish or Abort. Manual glass gets OPEN / CLOSE guidance; e-iris bodies can be pushed to target on command.")
                 .font(.system(size: 10.5))
                 .foregroundStyle(Theme.ink3)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1638,6 +1653,20 @@ struct ManualAssistPanel: View {
                     manualStat("MATCHED", "\(array.manualMatchedCount)/\(array.manualParticipantCount)")
                     manualStat("LATEST SPREAD", array.manualArraySpreadStops.map { String(format: "%.2fst", $0) } ?? "—")
                 }
+            }
+
+            // Array-wide operator-approved push — only shown when the session owns
+            // at least one e-iris participant. Disabled when they're all in
+            // tolerance (nothing to send).
+            if array.manualSessionActive, array.manualParticipants.contains(where: { $0.eIris }) {
+                Button(array.hybridPushableCount > 0
+                       ? "Push \(array.hybridPushableCount) e-iris → target"
+                       : "e-iris in tolerance") {
+                    array.pushAllHybridApertures()
+                }
+                .buttonStyle(DarkButtonStyle(prominent: array.hybridPushableCount > 0))
+                .disabled(array.hybridPushableCount == 0)
+                .help("Push every out-of-tolerance e-iris body one step toward the shared target. Re-press after they settle to converge; manual glass is never touched.")
             }
 
             if let drift = array.manualCommonDriftStops {
@@ -1803,37 +1832,58 @@ struct ManualCameraRow: View {
     @ObservedObject var node: CameraNode
 
     var body: some View {
-        Button {
-            if array.manualPhase == .trimming {
-                array.selectManualCamera(node)
-            } else {
-                array.selectedNodeID = node.id
+        HStack(spacing: 4) {
+            Button {
+                if array.manualPhase == .trimming {
+                    array.selectManualCamera(node)
+                } else {
+                    array.selectedNodeID = node.id
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Circle().fill(stateColor).frame(width: 6, height: 6)
+                    Text(node.status.name.isEmpty ? node.ip : node.status.name)
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.ink2)
+                        .lineLimit(1)
+                    // e-iris badge so the operator can see at a glance which
+                    // bodies Hybrid can drive vs. which need a hand on the ring.
+                    if node.eIris {
+                        Text("E-IRIS")
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(Theme.accent)
+                            .padding(.horizontal, 3).padding(.vertical, 1)
+                            .background(Capsule().fill(Theme.accentBG))
+                    }
+                    Spacer()
+                    Text(node.manualMatch.currentIRE.map { String(format: "%.1f", $0) } ?? "—")
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.ink3)
+                    Text(correctionText)
+                        .font(Theme.mono(10, weight: .bold))
+                        .foregroundStyle(stateColor)
+                        .frame(width: 58, alignment: .trailing)
+                    Text(node.manualMatch.phase.rawValue)
+                        .font(.system(size: 8.5, weight: .bold))
+                        .foregroundStyle(stateColor)
+                        .frame(width: 52, alignment: .trailing)
+                }
+                .padding(.horizontal, 5).padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 4)
+                    .fill(array.selectedNodeID == node.id ? Theme.accentBG : Color.clear))
             }
-        } label: {
-            HStack(spacing: 7) {
-                Circle().fill(stateColor).frame(width: 6, height: 6)
-                Text(node.status.name.isEmpty ? node.ip : node.status.name)
-                    .font(Theme.mono(9.5))
-                    .foregroundStyle(Theme.ink2)
-                    .lineLimit(1)
-                Spacer()
-                Text(node.manualMatch.currentIRE.map { String(format: "%.1f", $0) } ?? "—")
-                    .font(Theme.mono(9.5))
-                    .foregroundStyle(Theme.ink3)
-                Text(correctionText)
-                    .font(Theme.mono(10, weight: .bold))
-                    .foregroundStyle(stateColor)
-                    .frame(width: 58, alignment: .trailing)
-                Text(node.manualMatch.phase.rawValue)
+            .buttonStyle(.plain)
+
+            // Operator-approved push: only for e-iris participants, enabled when a
+            // real correction is pending. Manual glass shows no push affordance.
+            if node.eIris {
+                Button("PUSH") { array.pushHybridAperture(node) }
                     .font(.system(size: 8.5, weight: .bold))
-                    .foregroundStyle(stateColor)
-                    .frame(width: 52, alignment: .trailing)
+                    .buttonStyle(DarkButtonStyle())
+                    .disabled(!array.canPushHybrid(node))
+                    .help("Send this e-iris body one step toward the shared target. Re-press after it settles to converge.")
             }
-            .padding(.horizontal, 5).padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 4)
-                .fill(array.selectedNodeID == node.id ? Theme.accentBG : Color.clear))
         }
-        .buttonStyle(.plain)
     }
 
     var correctionText: String {
@@ -1970,8 +2020,26 @@ struct MatchLoopPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            // Array-wide manual override — a deliberate global bias after the
+            // match has landed. Only live while the loop is idle so it can never
+            // fight convergence.
+            if array.matchWorkflow == .electronic, !array.loopRunning,
+               array.nodes.contains(where: { array.canOverride($0) }) {
+                HStack(spacing: 8) {
+                    Text("ARRAY OVERRIDE")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Theme.ink3)
+                    Spacer()
+                    Button("Open all") { array.overrideNudgeAll(open: true) }
+                        .buttonStyle(DarkButtonStyle())
+                    Button("Close all") { array.overrideNudgeAll(open: false) }
+                        .buttonStyle(DarkButtonStyle())
+                }
+                .help("Nudge every e-iris body one step the same direction. The loop never auto-undoes an override — re-run the match to clear it.")
+            }
+
             // Per-camera delta table
-            let active = array.nodes.filter { $0.match.phase != .idle }
+            let active = array.nodes.filter { $0.match.phase != .idle || $0.match.manualOverride }
             if !active.isEmpty {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(active) { node in
@@ -1984,13 +2052,26 @@ struct MatchLoopPanel: View {
                                 .font(Theme.mono(10, weight: .semibold))
                                 .foregroundStyle(deltaColor(node))
                                 .frame(width: 42, alignment: .trailing)
-                            Text(node.match.phase.rawValue)
-                                .font(.system(size: 10))
-                                .foregroundStyle(Theme.ink2)
+                            Text(phaseText(node))
+                                .font(.system(size: 10, weight: node.match.manualOverride ? .bold : .regular))
+                                .foregroundStyle(node.match.manualOverride ? Theme.accent : Theme.ink2)
+                                .lineLimit(1)
                             Spacer()
-                            Text("\(node.match.nudgesUsed)")
-                                .font(Theme.mono(10))
-                                .foregroundStyle(Theme.ink3)
+                            // Per-camera override: click the lens open/closed one
+                            // step. Shown for e-iris bodies while the loop is idle;
+                            // otherwise the row shows the auto nudges spent.
+                            if array.canOverride(node) {
+                                Button("Open") { array.overrideNudge(node, open: true) }
+                                    .buttonStyle(DarkButtonStyle())
+                                    .help("Open this lens one list step (more exposure). Manual override — the loop won't undo it; re-run the match to clear.")
+                                Button("Close") { array.overrideNudge(node, open: false) }
+                                    .buttonStyle(DarkButtonStyle())
+                                    .help("Close this lens one list step (less exposure). Manual override — the loop won't undo it; re-run the match to clear.")
+                            } else {
+                                Text("\(node.match.nudgesUsed)")
+                                    .font(Theme.mono(10))
+                                    .foregroundStyle(Theme.ink3)
+                            }
                         }
                     }
                 }
@@ -1999,6 +2080,16 @@ struct MatchLoopPanel: View {
             }
         }
         .panelCard()
+    }
+
+    /// Match-loop phase text with the manual-override tag appended so an
+    /// overridden camera reads e.g. "matched · override (1 close)".
+    func phaseText(_ node: CameraNode) -> String {
+        guard node.match.manualOverride else { return node.match.phase.rawValue }
+        let n = node.match.overrideSteps
+        let tail = n == 0 ? "" : (n < 0 ? " (\(abs(n)) open)" : " (\(abs(n)) close)")
+        let base = node.match.phase == .idle ? "set" : node.match.phase.rawValue
+        return "\(base) · override\(tail)"
     }
 
     var statusPill: String {
