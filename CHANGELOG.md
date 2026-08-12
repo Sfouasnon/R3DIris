@@ -40,6 +40,22 @@ under a new version heading when you tag.
   phase/bench-spike framing and predecessor-project references).
 
 ### Fixed
+- **Sphere detection no longer rejects real spheres at the shadow gate or the
+  interior-std pre-filter.** Two measurement changes, no threshold constant
+  touched. (1) `shadow_specular` split the sphere interior along the axis to its
+  brightest *pixel*; on a mid-gray sphere carrying stream grain that pixel is
+  noise, and the resulting ratio crossed the 0.96 and 0.985 bounds
+  non-monotonically under small geometry error. The axis now comes from a
+  least-squares plane fit to the interior luma, and the fitted slope — the shading
+  strength, which is what says whether a terminator can carry information at all —
+  is logged alongside the ratio. (2) Pre-filter G2/G3 measured interior std at
+  full r, so a sphere sitting against a bright multiview pulled screen content
+  into the statistic and was hard-rejected before any gate ran; it now measures at
+  0.85r, clear of the limb transition. Measured over 13 KOMODO-X bench frames with
+  detector-independent ground-truth ROIs: frames clearing both stages goes from
+  8/13 to 13/13 at the primary bound, 10/13 to 13/13 including the `gating-2`
+  escape hatch, and no frame needs that escape hatch any more. Full analysis and
+  the offline harness are in `SPHERE_CLUE_FINDINGS.md`.
 - **Bench evidence capture now fails closed across reconnects and export errors.**
   Capture preflight locks the camera and livestream generation before accepting
   JPEGs; stale URL-session callbacks, missing start/end rect read-backs, quality

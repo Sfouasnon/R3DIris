@@ -21,9 +21,35 @@
 //     R3DMatch also gates in display space — but treat every number as
 //     provisional until the Phase 2 bench re-validates on real stream frames.
 //
+//  4. Shading axis: sphere.py's shadow/specular gate splits the interior along
+//     centre→brightest-PIXEL. We fit a plane to the interior luma instead and
+//     split along its gradient. Same threshold, better-conditioned estimator —
+//     the single bright pixel is noise on a mid-grey sphere carrying stream
+//     grain. See shadingSplit for the measured justification.
+//  5. Pre-filter G2/G3 measures interior std at 0.85r, not full r, to stay clear
+//     of the limb transition and whatever sits behind it. See detect().
+//
 //  Validated on live stream frames across the 2026-07-21 bench soaks
 //  (IRIS_MATCH_NOTES.md); ported thresholds refined there (e.g. the ire_spread
 //  probe geometry) and may still be tuned as more scenes are exercised.
+//  Divergences 4 and 5 were measured against 13 KOMODO-X bench frames with
+//  detector-independent ground-truth ROIs (2026-08-12; SPHERE_CLUE_FINDINGS.md):
+//  together they take the shadow gate from 10/13 to 13/13 and pre-filter G2 from
+//  11/13 to 13/13 on real spheres, matching what those gates read at exact
+//  ground-truth geometry, with no threshold constant changed.
+//
+//  DEFERRED — refine geometry before gating. Every pre-filter and gate measures a
+//  disk or ring derived from the raw Hough estimate (integer centre, integer modal
+//  radius), and refineToLimb only fixes the ROI afterwards, on the winner. Gating
+//  the refined geometry instead is correct in principle and was tried here: it
+//  REGRESSES pre-filter G2 back to 11/13, because refineToLimb currently oversizes
+//  by a median +5.5% (max +19.9% — measured against ground truth over the same 13
+//  frames), and 0.85r of an over-large radius lands back on the true full radius.
+//  The reorder is blocked on fixing refineToLimb itself: its ray search takes the
+//  strongest 1-px finite-difference gradient across a 0.55r–1.45r annulus, so a
+//  monitor bezel or card edge behind the sphere outvotes the limb. Wants a
+//  scale-aware derivative (Gaussian, σ ∝ r) and a preference for the crossing
+//  nearest the prior radius. Do that first, then reorder.
 
 import Foundation
 
@@ -181,11 +207,24 @@ enum SphereDetector {
             // against the aspect-normalized width (see normalizationWidth).
             if cand.r / normW < pfRadiusMin { continue }
 
-            // Pre-filter G2/G3 — interior std band.
+            // Pre-filter G2/G3 — interior std band, measured at 0.85r.
             // Clean pass ≤ 0.020; mid band ≤ 0.130 admitted WITHOUT the BRDF
             // score (divergence #2 above: temporal persistence replaces it);
             // > 0.130 rejected unconditionally; < 0.008 is a flat phantom.
-            let std = interiorStd(buf, cand.cx, cand.cy, cand.r)
+            //
+            // sphere.py measured this at FULL r, on renders where the sphere sat
+            // clear of its surround. The livestream sphere sits against whatever
+            // is behind it — dark drape one frame, a bright multiview the next —
+            // so a full-r disk swallows the limb transition and some background,
+            // and the statistic becomes the most geometry-sensitive number in the
+            // pipeline: a median 66.7% swing (max 108%) under ±5% radius error,
+            // against 22% at 0.85r. On 2 of 13 bench frames (both with the sphere
+            // abutting a bright multiview) full r read 0.1371 / 0.1381 on the raw
+            // Hough candidate — past the 0.130 ceiling, so the REAL sphere was
+            // hard-rejected here before any gate ran. At 0.85r the same two read
+            // 0.0866 / 0.0865 and all 13 pass. Band constants untouched; only the
+            // measurement radius moved.
+            let std = interiorStd(buf, cand.cx, cand.cy, cand.r * 0.85)
             if std > pfStdHardMax || std < pfStdFloor { continue }
 
             // Pre-filter G4 — RGB ratio (kills colored objects)
@@ -219,13 +258,18 @@ enum SphereDetector {
             gates.append(gLam)
             if !gLam.passed { lastFailedGates = gates; continue }
 
-            // Gate 3.5: Shadow / Specular (convexity) — rejects flat charts
-            let shadow = shadowRatio(buf, cand.cx, cand.cy, cand.r)
+            // Gate 3.5: Shadow / Specular (convexity) — rejects flat charts.
+            // `gradient` is the fitted luma slope per pixel: the shading STRENGTH
+            // on this candidate, logged because a near-zero slope means the
+            // lighting is too flat for a terminator to carry information at all
+            // (see shadingSplit).
+            let split = shadingSplit(buf, cand.cx, cand.cy, cand.r)
+            let shadow = split.ratio
             let gShadow = SphereGateResult(
                 gate: "shadow_specular",
                 passed: shadow <= gateShadowRatioMax,
                 value: shadow,
-                reason: String(format: "shadow_ratio=%.4f", shadow))
+                reason: String(format: "shadow_ratio=%.4f grad=%.2e/px", shadow, split.gradient))
             gates.append(gShadow)
             if !gShadow.passed {
                 lastFailedGates = gates
@@ -264,7 +308,13 @@ enum SphereDetector {
                 }
             }
 
-            // Gate 5: Interior Stddev
+            // Gate 5: Interior Stddev.
+            // NOTE: now that pre-filter G2/G3 measures at 0.85r too, and its band
+            // (0.008–0.130) is strictly inside this gate's (0.003–0.170), this
+            // gate can no longer fail — anything reaching here already passed the
+            // tighter band. Kept so the gate ladder in the log and the soak CSV
+            // stays shape-compatible; collapsing the two bands into one is a
+            // deliberate decision, not a cleanup.
             let std85 = interiorStd(buf, cand.cx, cand.cy, cand.r * 0.85)
             let gStd = SphereGateResult(
                 gate: "interior_stddev",
@@ -558,33 +608,99 @@ enum SphereDetector {
     }
 
     /// Shadow ratio at 0.7r: dark-half mean / bright-half mean, split along the
-    /// center→peak-luminance axis (sphere.py _gate_shadow_specular; peak_excess
-    /// is diagnostic-only there and omitted here).
-    private static func shadowRatio(_ buf: PixelBuffer, _ cx: Double, _ cy: Double, _ r: Double) -> Double {
-        var peakLum: Float = -1
-        var peakX = 0, peakY = 0
-        var interior: [(x: Int, y: Int, lum: Float)] = []
+    /// SHADING axis — the direction of steepest interior luma increase, taken
+    /// from a least-squares plane fit over the same 0.7r disk
+    /// (sphere.py _gate_shadow_specular; peak_excess is diagnostic-only there
+    /// and omitted here).
+    ///
+    /// DIVERGENCE from sphere.py, and the reason for it: the original split along
+    /// centre→brightest-PIXEL. On a ~50 IRE sphere carrying stream grain that one
+    /// pixel is noise. Measured across 13 bench frames (SPHERE_CLUE_FINDINGS.md):
+    /// the peak-pixel axis disagreed with the plane fit by a median 43° (max 74°);
+    /// its ratio swung a median 2.8% / max 15.2% under ±5% radius error and did so
+    /// NON-monotonically, crossing both the 0.960 and 0.985 bounds in each
+    /// direction; and it failed the ≤0.960 gate on 3 of 13 REAL spheres, one at
+    /// 0.9899 — past the pass2 bound too, so that sphere was rejected outright.
+    /// The plane-fit axis passes 13/13 at ≤0.960 (max 0.9296) and swings ≤2.1%,
+    /// monotonically. Ported thresholds are untouched; only the axis estimator
+    /// changed.
+    ///
+    /// `gradient` is the fitted luma slope per pixel — the shading STRENGTH, and
+    /// the natural applicability weight for this whole channel. It spanned
+    /// 0.0006–0.0033/px across the bench corpus, i.e. the terminator really is
+    /// several times weaker in some frames than others. Near zero means the
+    /// lighting is too flat for a terminator to exist, so a ratio near 1.0 should
+    /// be read as "this channel has no evidence to offer" rather than as "not a
+    /// sphere" — which is what the pass2 escape hatch is standing in for today.
+    private static func shadingSplit(_ buf: PixelBuffer, _ cx: Double, _ cy: Double,
+                                    _ r: Double) -> (ratio: Double, axis: (Double, Double), gradient: Double) {
+        // One pass: collect the interior samples and accumulate the plane-fit
+        // normal equations. dx/dy are relative to the candidate centre.
+        var sxx = 0.0, sxy = 0.0, syy = 0.0, sx = 0.0, sy = 0.0
+        var sv = 0.0, sxv = 0.0, syv = 0.0
+        var interior: [(dx: Double, dy: Double, lum: Float)] = []
         forEachDiskPixelXY(buf, cx, cy, r * 0.7) { x, y, i in
-            let v = buf.luma[i]
-            interior.append((x, y, v))
-            if v > peakLum { peakLum = v; peakX = x; peakY = y }
+            let dx = Double(x) - cx, dy = Double(y) - cy
+            let lum = buf.luma[i]
+            let v = Double(lum)
+            interior.append((dx, dy, lum))
+            sxx += dx * dx; sxy += dx * dy; syy += dy * dy
+            sx += dx; sy += dy
+            sv += v; sxv += dx * v; syv += dy * v
         }
-        guard interior.count >= 20 else { return 0.0 }  // too few pixels — pass (sphere.py behavior)
+        // sphere.py behavior: too few interior pixels ⇒ 0.0, which passes the gate.
+        guard interior.count >= 20 else { return (0.0, (1.0, 0.0), 0.0) }
 
-        var dx = Double(peakX) - cx, dy = Double(peakY) - cy
-        let norm = hypot(dx, dy)
-        if norm > 1.0 { dx /= norm; dy /= norm } else { dx = 1; dy = 0 }
+        // Fit luma ≈ a·dx + b·dy + c. Normal equations, solved by Gaussian
+        // elimination with partial pivoting (same pattern as kasaFit below):
+        //   [sxx sxy sx][a]   [sxv]
+        //   [sxy syy sy][b] = [syv]
+        //   [sx  sy  n ][c]   [sv ]
+        // (a, b) is the luma gradient; its direction is the shading axis. The
+        // matrix is the second-moment matrix of a disk, so it is well conditioned
+        // unless the sample set is degenerate — then we keep the +x fallback,
+        // which reproduces the old behavior for that pathological case.
+        var m = [[sxx, sxy, sx, sxv],
+                 [sxy, syy, sy, syv],
+                 [sx, sy, Double(interior.count), sv]]
+        var ax = 1.0, ay = 0.0, gradient = 0.0
+        var solved = true
+        for col in 0..<3 {
+            var pivot = col
+            for row in (col + 1)..<3 where abs(m[row][col]) > abs(m[pivot][col]) { pivot = row }
+            if abs(m[pivot][col]) < 1e-12 { solved = false; break }
+            m.swapAt(col, pivot)
+            let div = m[col][col]
+            for j in col..<4 { m[col][j] /= div }
+            for row in 0..<3 where row != col {
+                let factor = m[row][col]
+                if factor != 0 {
+                    for j in col..<4 { m[row][j] -= factor * m[col][j] }
+                }
+            }
+        }
+        if solved {
+            let a = m[0][3], b = m[1][3]
+            let g = hypot(a, b)
+            if g > 1e-12 { ax = a / g; ay = b / g; gradient = g }
+        }
 
         var brightSum: Double = 0, brightN = 0
         var darkSum: Double = 0, darkN = 0
         for p in interior {
-            let proj = (Double(p.x) - cx) * dx + (Double(p.y) - cy) * dy
+            let proj = p.dx * ax + p.dy * ay
             if proj >= 0 { brightSum += Double(p.lum); brightN += 1 }
             else { darkSum += Double(p.lum); darkN += 1 }
         }
         let brightMean = brightN > 0 ? brightSum / Double(brightN) : 0
         let darkMean = darkN > 0 ? darkSum / Double(darkN) : 0
-        return darkMean / max(brightMean, 1e-6)
+        return (darkMean / max(brightMean, 1e-6), (ax, ay), gradient)
+    }
+
+    /// Ratio-only accessor, for the call sites that don't need the axis or the
+    /// shading strength (signature capture and signature matching).
+    private static func shadowRatio(_ buf: PixelBuffer, _ cx: Double, _ cy: Double, _ r: Double) -> Double {
+        shadingSplit(buf, cx, cy, r).ratio
     }
 
     /// Hero IRE probe: disk 0.24r at center, drop zeros, 5–95 percentile trim,
@@ -673,6 +789,11 @@ enum SphereDetector {
         // no votes) — the classic symptom is a small circle hugging the
         // specular lobe and a hero IRE read off the highlight. Refining
         // against the actual luma limb fixes both position and measurement.
+        //
+        // NOTE: this runs on the WINNER only, after the ladder, so every value in
+        // `gates` was measured on the pre-refinement geometry. That ordering is
+        // wrong in principle — see the deferred-reorder note in the file header —
+        // but correcting it is blocked on refineToLimb's own bias.
         let roi = refineToLimb(SphereROI(cx: cand.cx, cy: cand.cy, r: cand.r), in: buf)
         return SphereDetection(
             status: status, roi: roi,
