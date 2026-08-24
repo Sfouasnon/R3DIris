@@ -47,11 +47,14 @@ struct ArrayView: View {
                     VStack(alignment: .leading, spacing: 16) {
                         ArrayActionsPanel()
                         MatchWorkflowPanel()
-                        if array.matchWorkflow == .electronic {
+                        switch array.matchWorkflow {
+                        case .electronic:
                             IrisMatchPanel()
                             MatchLoopPanel()
-                        } else {
+                        case .hybrid:
                             ManualAssistPanel()
+                        case .calibrate:
+                            CalibrationPanel()
                         }
                         SoakPanel(soak: array.soak)
                         if let node = array.selectedNode {
@@ -254,7 +257,7 @@ struct CameraTile: View {
                         .font(.system(size: 11))
                         .foregroundStyle(Theme.ink3)
                 }
-                if array.matchWorkflow == .hybrid, array.manualSessionActive,
+                if array.usesOperatorGuidance, array.manualSessionActive,
                    node.manualMatch.phase != .idle {
                     ManualCameraHUD(info: node.manualMatch, selected: selected)
                         .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSm))
@@ -308,6 +311,25 @@ struct CameraTile: View {
                         .help("Livestream frozen — frames stopped changing. Check the camera feed / mirror source.")
                 }
                 Spacer()
+                // Working through 36 bodies, "is this one done?" must be
+                // answerable at a glance without opening the roll.
+                if array.calibrateMode,
+                   array.calibrationPrewarmedIDs.contains(node.id) {
+                    Text("READY")
+                        .font(Theme.mono(9, weight: .bold))
+                        .foregroundStyle(Theme.accent)
+                        .padding(.horizontal, 5).padding(.vertical, 2)
+                        .background(RoundedRectangle(cornerRadius: 4).fill(Theme.accentBG))
+                        .help("Warmed ahead of its turn: stream live and output already in the calibration transform. The run will not wait on it.")
+                }
+                if array.calibrateMode, array.isInCalibrationRoll(node) {
+                    Text("ROLL")
+                        .font(Theme.mono(9, weight: .bold))
+                        .foregroundStyle(Theme.good)
+                        .padding(.horizontal, 5).padding(.vertical, 2)
+                        .background(RoundedRectangle(cornerRadius: 4).fill(Theme.goodBG))
+                        .help("Recorded in the calibration roll. Re-calibrating replaces its row.")
+                }
                 matchChip
             }
 
@@ -338,6 +360,17 @@ struct CameraTile: View {
                     Button("Re-detect") { node.redetect() }
                         .buttonStyle(DarkButtonStyle())
                         .disabled(!stream.isStreaming)
+                    // Starts the whole run AT this body, then continues down
+                    // the array in IP order. The panel's button starts from the
+                    // lowest IP instead.
+                    if array.calibrateMode, !array.calibrationRunActive {
+                        Button("Calibrate From Here") {
+                            array.beginCalibrationRun(startingAt: node)
+                        }
+                        .buttonStyle(DarkButtonStyle(prominent: true))
+                        .disabled(!array.canStartRunHere(node))
+                        .help("Begin the calibration run at this camera and continue through the rest of the array in IP order.")
+                    }
                 }
                 Spacer()
                 Button {
@@ -467,7 +500,7 @@ struct CameraTile: View {
 
     @ViewBuilder
     var matchChip: some View {
-        if array.matchWorkflow == .hybrid, array.manualSessionActive,
+        if array.usesOperatorGuidance, array.manualSessionActive,
            node.manualMatch.phase != .idle {
             Text(manualMatchLabel)
                 .font(Theme.mono(10, weight: .semibold))
@@ -830,6 +863,14 @@ struct FullscreenCameraView: View {
         array.manualSessionActive && array.isManualParticipant(node)
     }
 
+    /// Click-to-seed is normally locked out during a session. The calibrate run
+    /// deliberately re-opens it for the focused body: seeding each camera when
+    /// the run reaches it IS the flow.
+    private var seedingAllowed: Bool {
+        !manualActive
+            || (array.calibrationAwaitingSeed && array.fullScreenNodeID == node.id)
+    }
+
     private var manualRecovering: Bool {
         manualActive
             && array.manualPhase == .trimming
@@ -870,7 +911,7 @@ struct FullscreenCameraView: View {
                     // This overlay tracks the fitted image frame, the same space
                     // the overlays draw in, so the click maps to normalized.
                     .overlay {
-                        if !manualActive {
+                        if seedingAllowed {
                             GeometryReader { geo in
                                 Color.clear
                                     .contentShape(Rectangle())
@@ -933,8 +974,12 @@ struct FullscreenCameraView: View {
                             .foregroundStyle(Theme.accent)
                     }
                     Spacer()
-                    if !manualActive || array.manualPhase == .trimming {
-                        if manualActive && array.manualAdvanceMode == .operatorProceed {
+                    // During a calibrate run the sequence is driven, not
+                    // hand-advanced: showing a Proceed or Next Camera control
+                    // here would let the operator fight the run loop.
+                    if !manualActive
+                        || (array.manualPhase == .trimming && !array.calibrateMode) {
+                        if manualActive && array.effectiveAdvanceMode == .operatorProceed {
                             Button {
                                 array.proceedManualMatch()
                             } label: {
@@ -964,13 +1009,38 @@ struct FullscreenCameraView: View {
                             .help("Jump to the next camera (ID order) without minimizing")
                         }
                     }
-                    if manualActive,
-                       (array.manualPhase == .preparing
-                        || array.manualPhase == .trimming) {
-                        Button("Abort & Restore") {
-                            array.abortManualMatch()
+                    // Grouped to keep this HStack under the ten-child
+                    // ViewBuilder limit, which it was already close to.
+                    Group {
+                        // Start the run without dropping out of fullscreen.
+                        if array.calibrateMode, !manualActive,
+                           !array.calibrationRunActive {
+                            Button("Start Run Here") {
+                                array.beginCalibrationRun(startingAt: node)
+                            }
+                            .buttonStyle(DarkButtonStyle(prominent: true))
+                            .disabled(!array.canStartRunHere(node))
+                            .help("Begin the calibration run at this camera and continue in IP order. Each body is seeded when the run reaches it.")
                         }
-                        .buttonStyle(DarkButtonStyle(destructive: true))
+                        // The run's own controls, in reach of the hand on the ring.
+                        if array.calibrateMode, array.calibrationRunActive,
+                           array.manualPhase == .trimming
+                            || array.calibrationAwaitingSeed {
+                            Button("Skip") { array.skipCalibrationCamera() }
+                                .buttonStyle(DarkButtonStyle())
+                                .help("Leave this body un-calibrated and move the run to the next camera.")
+                            Button("Stop Run") { array.stopCalibrationRun() }
+                                .buttonStyle(DarkButtonStyle(destructive: true))
+                                .help("Stop after this camera. Its output preset is still restored.")
+                        }
+                        if manualActive,
+                           (array.manualPhase == .preparing
+                            || array.manualPhase == .trimming) {
+                            Button("Abort & Restore") {
+                                array.abortManualMatch()
+                            }
+                            .buttonStyle(DarkButtonStyle(destructive: true))
+                        }
                     }
                     Button {
                         array.fullScreenNodeID = nil
@@ -983,14 +1053,19 @@ struct FullscreenCameraView: View {
                         manualActive
                             && (array.manualPhase == .preparing
                                 || (array.manualPhase == .trimming
-                                    && array.manualAdvanceMode == .operatorProceed))
+                                    && array.effectiveAdvanceMode == .operatorProceed
+                                    // Calibrate forces operatorProceed to stop
+                                    // the auto-handoff, but with a single body
+                                    // there is no gate to bypass — trapping the
+                                    // operator in fullscreen would be pointless.
+                                    && !array.calibrateMode))
                     )
                     .help("Exit full screen (Esc)")
                 }
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .background(LinearGradient(colors: [Color.black.opacity(0.7), .clear],
                                            startPoint: .top, endPoint: .bottom))
-                if !manualActive, node.pendingSeed == nil {
+                if seedingAllowed, node.pendingSeed == nil {
                     Text(node.sphere.seeded ? "Sphere locked — click to re-place, or Re-detect to clear"
                                             : "Click the sphere center to place a mask")
                         .font(.system(size: 11))
@@ -998,7 +1073,7 @@ struct FullscreenCameraView: View {
                         .padding(.top, 2)
                 }
                 Spacer()
-                if !manualActive, let seed = node.pendingSeed {
+                if seedingAllowed, let seed = node.pendingSeed {
                     SeedControlBar(node: node, seed: seed)
                 }
             }
@@ -1009,7 +1084,9 @@ struct FullscreenCameraView: View {
             if !manualActive
                 || (array.manualPhase != .preparing
                     && !(array.manualPhase == .trimming
-                        && array.manualAdvanceMode == .operatorProceed)) {
+                        && array.effectiveAdvanceMode == .operatorProceed
+                        // Single-body calibrate has no handoff gate to bypass.
+                        && !array.calibrateMode)) {
                 array.fullScreenNodeID = nil
             }
         }
@@ -1422,8 +1499,8 @@ struct ArrayActionsPanel: View {
                 .buttonStyle(DarkButtonStyle())
                 .disabled(array.manualSessionActive)
                 .help("Per body: APERTURE_CONTROL gate, AE warning, valid stop list, APERTURE subscription for the settle detector. Identifies which bodies are e-iris — required before Hybrid can push them. One deliberate operator action — rule 11.")
-            if array.matchWorkflow == .hybrid {
-                Text("Hybrid drives APERTURE only on e-iris bodies you explicitly push to target; manual glass is hand-guided with OPEN / CLOSE and never receives a command.")
+            if array.usesOperatorGuidance {
+                Text("Hybrid and Calibrate drive APERTURE only on e-iris bodies you explicitly push to target; manual glass is hand-guided with OPEN / CLOSE and never receives a command.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(Theme.ink3)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1490,9 +1567,7 @@ struct MatchWorkflowPanel: View {
             .labelsHidden()
             .disabled(array.workflowBusy)
 
-            Text(array.matchWorkflow == .electronic
-                 ? "Electronic drives every supported iris over RCP2 automatically and verifies settle after each move — best for an all-motorized array."
-                 : "Hybrid captures one shared target, hand-guides manual glass with live OPEN / CLOSE, and lets you push any e-iris body to target on command. Mixed rigs welcome.")
+            Text(workflowExplainer)
                 .font(.system(size: 10.5))
                 .foregroundStyle(Theme.ink3)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1503,6 +1578,17 @@ struct MatchWorkflowPanel: View {
                 .help("Lock every camera's current auto-detected sphere as a durable operator seed so the solve survives a workflow switch and the Log3G10 swap. Run this before leaving Electronic so you never lose the solve on the way into Hybrid.")
         }
         .panelCard()
+    }
+
+    private var workflowExplainer: String {
+        switch array.matchWorkflow {
+        case .electronic:
+            return "Electronic drives every supported iris over RCP2 automatically and verifies settle after each move — best for an all-motorized array."
+        case .hybrid:
+            return "Hybrid captures one shared target, hand-guides manual glass with live OPEN / CLOSE, and lets you push any e-iris body to target on command. Mixed rigs welcome."
+        case .calibrate:
+            return "Calibrate runs ONE body at a time against an integrating sphere. Establish the target on the first camera, pin it, and every camera after it trims to that same IRE — manual glass by hand, e-iris on command."
+        }
     }
 }
 
@@ -1746,6 +1832,519 @@ struct ManualAssistPanel: View {
         .padding(7)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 5).fill(Theme.panel2))
+    }
+}
+
+// MARK: - Calibrate panel (one body at a time)
+
+struct CalibrationPanel: View {
+    @EnvironmentObject var array: ArrayController
+    @State private var confirmingClearRoll = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            GroupHeader(title: "Calibrate",
+                        count: headerCount,
+                        warn: array.manualSessionActive,
+                        danger: array.manualPhase == .failed)
+
+            Text("One press walks every connected camera in IP order. Per body: solve the sphere, dial to target, hold \(String(format: "%.0f", array.manualHoldSeconds))s, re-verify, restore the output — then it moves on. The next \(ArrayController.calibrationPrewarmDepth) cameras are brought up behind it, so you are only ever waiting on your own solve.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Grouped: a ViewBuilder body takes at most ten children, and this
+            // panel has more sections than that.
+            Group {
+                monitoringPicker
+                targetSection
+                toleranceRow
+                sessionControls
+            }
+
+            Text(array.manualStatus)
+                .font(.system(size: 10.5))
+                .foregroundStyle(array.manualPhase == .failed ? Theme.danger : Theme.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let target = array.manualTargetIRE {
+                HStack(spacing: 6) {
+                    stat("TARGET", String(format: "%.1f IRE", target))
+                    stat("DELTA", focusedDeltaText)
+                    stat("CORRECTION", focusedCorrectionText)
+                }
+            }
+
+            eIrisPush
+            trimFocus
+            rollSection
+        }
+        .panelCard()
+    }
+
+    // MARK: Monitoring
+
+    private var monitoringPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("Monitoring", selection: $array.manualTransform) {
+                ForEach(ArrayController.ManualTransform.allCases) { t in
+                    Text(t.rawValue).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(array.manualSessionActive)
+
+            Text(array.manualTransform.isLog3G10
+                 ? "Swaps this camera's mirrored output to Log3G10 for the session and restores its saved preset on finish."
+                 : "Display/IPP2 stop math is not yet bench-calibrated, so calibration is blocked in this mode. Select Log3G10.")
+                .font(.system(size: 10))
+                .foregroundStyle(array.manualTransform.isLog3G10 ? Theme.ink3 : Theme.warn)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: Target
+
+    private var targetSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("Target source", selection: $array.calibrationTargetSource) {
+                ForEach(ArrayController.CalibrationTargetSource.allCases) { source in
+                    Text(source.rawValue).tag(source)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(array.manualSessionActive)
+
+            Text(targetSourceExplainer)
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if array.calibrationTargetSource == .gray18 {
+                HStack(spacing: 8) {
+                    Text("Anchor")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.ink2)
+                    Spacer()
+                    Text(String(format: "%.1f IRE", array.manualTransform.isLog3G10
+                                ? Log3G10.grayAnchorIRE : ArrayController.ipp2GrayAnchorIRE))
+                        .font(Theme.mono(11, weight: .semibold))
+                        .foregroundStyle(Theme.ink)
+                }
+            }
+            if array.calibrationTargetSource == .custom {
+                HStack(spacing: 8) {
+                    Text("Target IRE")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.ink2)
+                    Spacer()
+                    TextField("33.3", text: $array.calibrationTargetText)
+                        .darkField()
+                        .frame(width: 78)
+                }
+                .disabled(array.manualSessionActive)
+            }
+
+            if let pin = array.calibrationPin,
+               !array.calibrationTargetSource.isAbsolute {
+                HStack(spacing: 7) {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Theme.accent)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(String(format: "PINNED %.2f IRE · %@", pin.ire, pin.transform))
+                            .font(Theme.mono(10.5, weight: .bold))
+                            .foregroundStyle(Theme.ink)
+                        Text("from \(pin.sourceCameraID.isEmpty ? "—" : pin.sourceCameraID) · \(Self.stamp.string(from: pin.capturedAt))")
+                            .font(Theme.mono(9.5))
+                            .foregroundStyle(Theme.ink3)
+                    }
+                    Spacer()
+                    if array.canPinCalibrationTarget, !isEstablishCamera {
+                        Button("Re-pin") { array.pinCalibrationTarget() }
+                            .buttonStyle(DarkButtonStyle())
+                            .help("Replace the stored reference with this session's current target.")
+                    }
+                    Button("Clear") { array.clearCalibrationPin() }
+                        .buttonStyle(DarkButtonStyle(destructive: true))
+                        .disabled(array.manualSessionActive)
+                }
+                .padding(7)
+                .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.accentBG))
+            }
+
+            if let failure = array.calibrationTargetFailure(), !array.manualSessionActive {
+                Text(failure)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.warn)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var targetSourceExplainer: String {
+        switch array.calibrationTargetSource {
+        case .gray18:
+            return String(format: "Absolute anchor: 18%% gray sits at %.1f IRE in %@. Every camera — including the first — is hand-dialed to it.",
+                          array.manualTransform.isLog3G10 ? Log3G10.grayAnchorIRE : ArrayController.ipp2GrayAnchorIRE,
+                          array.manualTransform.isLog3G10 ? "Log3G10" : "IPP2")
+        case .establish:
+            return "The first camera is NOT dialed: whatever it reads becomes the target and is pinned immediately. Every camera after it is dialed to match that reading."
+        case .pinned:
+            return "Every camera is dialed to match the stored reading. Nothing to type, and the number cannot drift between bodies or across restarts."
+        case .custom:
+            return "Absolute: trim every camera to the IRE you enter. Nothing is pinned — the number did not come from a reading."
+        }
+    }
+
+    // MARK: Tolerance
+
+    private var toleranceRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Tolerance")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.ink2)
+                    .frame(width: 72, alignment: .leading)
+                Slider(value: $array.manualToleranceStops, in: 0.02...0.30, step: 0.01)
+                    .controlSize(.small)
+                    .disabled(array.manualSessionActive)
+                Text(String(format: "±%.2fst", array.manualToleranceStops))
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.ink)
+                    .frame(width: 62, alignment: .trailing)
+            }
+            HStack {
+                Text("Stable hold")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.ink2)
+                Spacer()
+                Text(String(format: "%.1fs fixed", array.manualHoldSeconds))
+                    .font(Theme.mono(10.5, weight: .semibold))
+                    .foregroundStyle(Theme.ink)
+            }
+        }
+    }
+
+    // MARK: Session controls
+
+    @ViewBuilder
+    private var sessionControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if array.calibrationRunActive {
+                runProgress
+                activeRunControls
+            } else {
+                idleRunControls
+            }
+            HStack {
+                Spacer()
+                Text(runStateLabel)
+                    .font(Theme.mono(9.5, weight: .bold))
+                    .foregroundStyle(runStateHighlighted ? Theme.accent : phaseColor)
+            }
+        }
+    }
+
+    /// Where the run is, and what it will visit next.
+    private var runProgress: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(array.calibrationCamera.map { "NOW: \($0.displayName)" } ?? "NOW: —")
+                    .font(Theme.mono(10.5, weight: .bold))
+                    .foregroundStyle(Theme.ink)
+                Spacer()
+                Text("\(min(array.calibrationQueueIndex + 1, array.calibrationRunTotal))/\(array.calibrationRunTotal)")
+                    .font(Theme.mono(10.5, weight: .bold))
+                    .foregroundStyle(Theme.accent)
+            }
+            ProgressView(
+                value: Double(array.calibrationQueueIndex),
+                total: Double(max(1, array.calibrationRunTotal))
+            )
+            .controlSize(.small)
+            .tint(Theme.accent)
+            if let next = nextInQueue {
+                HStack(spacing: 5) {
+                    Text("next: \(next.displayName) · \(next.ip)")
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.ink3)
+                    if array.calibrationPrewarmedIDs.contains(next.id) {
+                        Text("READY")
+                            .font(Theme.mono(8, weight: .bold))
+                            .foregroundStyle(Theme.good)
+                    }
+                    Spacer()
+                    Text("\(array.calibrationPrewarmedIDs.count) warmed")
+                        .font(Theme.mono(8.5))
+                        .foregroundStyle(Theme.ink3)
+                }
+            } else {
+                Text("last camera in the run")
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.ink3)
+            }
+        }
+        .padding(7)
+        .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.accentBG))
+    }
+
+    @ViewBuilder
+    private var activeRunControls: some View {
+        if array.calibrationAwaitingSeed {
+            Text("Click the sphere centre in fullscreen, size the mask, and Approve. The run is holding here.")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.accent)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        HStack(spacing: 8) {
+            // Optional, and only on the establish camera. That camera is NOT
+            // dialed — its reading is already the target — but if it happened to
+            // be at a silly aperture this re-points the run without restarting it.
+            if array.canSetCalibrationTargetFromLive, isEstablishCamera,
+               array.calibrationTargetSource == .establish
+                || array.calibrationTargetSource == .pinned {
+                Button("Re-target from Live") { array.setCalibrationTargetFromLive() }
+                    .buttonStyle(DarkButtonStyle())
+                    .help("Take this camera's current reading as the run's target instead. Re-pins it and restarts the hold.")
+            }
+            if array.manualPhase == .restoring {
+                ProgressView().controlSize(.small)
+                Text("Restoring…")
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.ink2)
+            } else {
+                Button("Skip Camera") { array.skipCalibrationCamera() }
+                    .buttonStyle(DarkButtonStyle())
+                    .help("Leave this body un-calibrated and advance the run.")
+            }
+            Button("Stop Run") { array.stopCalibrationRun() }
+                .buttonStyle(DarkButtonStyle(destructive: true))
+                .help("Stop after this camera. Its saved output preset is still restored.")
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private var idleRunControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if array.manualRestorePending {
+                HStack(spacing: 8) {
+                    Button("Retry Output Restore") { array.retryManualRestore() }
+                        .buttonStyle(DarkButtonStyle(prominent: true))
+                    Text("\(array.manualChangedOutputCount) pending")
+                        .font(Theme.mono(9.5, weight: .bold))
+                        .foregroundStyle(Theme.danger)
+                    Spacer()
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Button("Begin Calibration Run") { array.beginCalibrationRun() }
+                        .buttonStyle(DarkButtonStyle(prominent: true))
+                        .disabled(!array.canBeginCalibrationRun)
+                        .help("Walk every connected camera in IP order. Each body is seeded, trimmed, held, re-verified and restored before the run moves to the next.")
+                    Text("\(array.calibrationRunOrder.count) connected")
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.ink3)
+                    Spacer()
+                }
+                if !array.calibrationRunOrder.isEmpty {
+                    Text("order: " + array.calibrationRunOrder.prefix(4)
+                            .map(\.displayName).joined(separator: " → ")
+                         + (array.calibrationRunOrder.count > 4 ? " → …" : ""))
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.ink3)
+                        .lineLimit(1)
+                }
+            }
+        }
+    }
+
+    /// The run's first camera — where the number for the whole set is chosen.
+    /// Kept available for the WHOLE of that camera's session, not just while the
+    /// commit gate is armed, so the operator can still re-point the target after
+    /// committing but before it certifies.
+    private var isEstablishCamera: Bool {
+        array.calibrationRunActive && array.calibrationQueueIndex == 0
+    }
+
+    private var runStateLabel: String {
+        if array.calibrationAwaitingSeed { return "AWAITING SEED" }
+        if array.calibrationReverifying { return "RE-VERIFYING" }
+        return array.manualPhase.rawValue.uppercased()
+    }
+
+    private var runStateHighlighted: Bool {
+        array.calibrationAwaitingSeed || array.calibrationReverifying
+    }
+
+    private var nextInQueue: CameraNode? {
+        let nodes = array.calibrationQueueNodes
+        let next = array.calibrationQueueIndex + 1
+        return next < nodes.count ? nodes[next] : nil
+    }
+
+    // MARK: e-iris
+
+    @ViewBuilder
+    private var eIrisPush: some View {
+        if array.manualSessionActive,
+           array.manualParticipants.contains(where: { $0.eIris }) {
+            Button(array.hybridPushableCount > 0
+                   ? "Push e-iris → target"
+                   : "e-iris in tolerance") {
+                array.pushAllHybridApertures()
+            }
+            .buttonStyle(DarkButtonStyle(prominent: array.hybridPushableCount > 0))
+            .disabled(array.hybridPushableCount == 0)
+            .help("Push this e-iris body one step toward the target. Re-press after it settles to converge — the same feedback loop as a hand on a manual ring.")
+        }
+    }
+
+    @ViewBuilder
+    private var trimFocus: some View {
+        if let active = array.fullScreenNode, array.isManualParticipant(active) {
+            ManualTrimFocus(node: active)
+        } else if let node = array.calibrationCamera, array.manualSessionActive {
+            ManualCameraRow(node: node)
+        }
+    }
+
+    // MARK: Roll
+
+    @ViewBuilder
+    private var rollSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("CALIBRATION ROLL")
+                    .font(.system(size: 8, weight: .bold))
+                    .tracking(0.9)
+                    .foregroundStyle(Theme.ink3)
+                Spacer()
+                Text("\(array.calibrationRoll.count) camera\(array.calibrationRoll.count == 1 ? "" : "s")")
+                    .font(Theme.mono(9.5, weight: .bold))
+                    .foregroundStyle(array.calibrationRoll.isEmpty ? Theme.ink3 : Theme.good)
+            }
+
+            if array.calibrationRoll.isEmpty {
+                Text("Empty. Each camera is written here the moment it certifies — not at the end — so a crash mid-run costs one body, not the set.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.ink3)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                if let spread = array.calibrationRollSpreadStops {
+                    HStack {
+                        Text("SET SPREAD")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(Theme.ink3)
+                        Spacer()
+                        Text(String(format: "%.3f st", spread))
+                            .font(Theme.mono(10.5, weight: .bold))
+                            .foregroundStyle(spread <= array.manualToleranceStops ? Theme.good : Theme.warn)
+                    }
+                }
+                VStack(spacing: 2) {
+                    ForEach(array.calibrationRoll) { row in
+                        HStack(spacing: 6) {
+                            Text(row.displayID)
+                                .font(Theme.mono(10, weight: .bold))
+                                .foregroundStyle(Theme.ink)
+                                .frame(width: 34, alignment: .leading)
+                            Text("T \(row.stopLabel)")
+                                .font(Theme.mono(9.5))
+                                .foregroundStyle(Theme.ink3)
+                            Spacer()
+                            Text(String(format: "%.2f IRE", row.finalIRE))
+                                .font(Theme.mono(10))
+                                .foregroundStyle(Theme.ink2)
+                            Text(String(format: "%+.3f st", row.correctionStops))
+                                .font(Theme.mono(10, weight: .semibold))
+                                .foregroundStyle(abs(row.correctionStops) <= array.manualToleranceStops
+                                                 ? Theme.good : Theme.warn)
+                                .frame(width: 62, alignment: .trailing)
+                        }
+                    }
+                }
+                .padding(7)
+                .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.panel2))
+
+                HStack(spacing: 8) {
+                    Button("Save Calibration Roll") { array.saveCalibrationRoll() }
+                        .buttonStyle(DarkButtonStyle(prominent: true))
+                        .disabled(array.manualSessionActive)
+                    if confirmingClearRoll {
+                        Button("Confirm clear") {
+                            array.clearCalibrationRoll()
+                            confirmingClearRoll = false
+                        }
+                        .buttonStyle(DarkButtonStyle(destructive: true))
+                        Button("Cancel") { confirmingClearRoll = false }
+                            .buttonStyle(DarkButtonStyle())
+                    } else {
+                        Button("Clear roll") { confirmingClearRoll = true }
+                            .buttonStyle(DarkButtonStyle())
+                            .disabled(array.manualSessionActive)
+                    }
+                    Spacer()
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: Theme.radiusSm).fill(Theme.panel2.opacity(0.6)))
+    }
+
+    // MARK: Bits
+
+    private static let stamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    private var headerCount: String {
+        array.calibrationRunActive
+            ? "\(min(array.calibrationQueueIndex + 1, array.calibrationRunTotal))/\(array.calibrationRunTotal)"
+            : "\(array.calibrationRoll.count) recorded"
+    }
+
+    private var focusedDeltaText: String {
+        guard let node = array.calibrationCamera,
+              let delta = node.manualMatch.deltaIRE else { return "—" }
+        return String(format: "%+.2f IRE", delta)
+    }
+
+    private var focusedCorrectionText: String {
+        guard let node = array.calibrationCamera,
+              let correction = node.manualMatch.correctionStops,
+              correction.isFinite else { return "—" }
+        return String(format: "%+.3f st", correction)
+    }
+
+    private func stat(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: 7.5, weight: .bold))
+                .tracking(0.8)
+                .foregroundStyle(Theme.ink3)
+            Text(value)
+                .font(Theme.mono(10.5, weight: .semibold))
+                .foregroundStyle(Theme.ink)
+        }
+        .padding(7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 5).fill(Theme.panel2))
+    }
+
+    private var phaseColor: Color {
+        switch array.manualPhase {
+        case .complete, .finished: return Theme.good
+        case .failed: return Theme.danger
+        case .preparing, .restoring: return Theme.warn
+        case .trimming: return Theme.accent
+        case .idle: return Theme.idle
+        }
     }
 }
 

@@ -115,6 +115,13 @@ final class ArrayController: ObservableObject {
         // one command. An all-manual rig behaves exactly like the old Manual
         // Assist; an all-e-iris rig just gets push buttons instead of hand-trims.
         case hybrid = "Hybrid"
+        // Calibrate is the single-body bench mode: one camera at a time against
+        // an integrating sphere, trimmed to a target IRE that was established on
+        // the first camera and pinned for every camera after it. It runs the
+        // SAME session machinery as Hybrid — the only differences are that the
+        // participant set is one explicitly chosen camera instead of everything
+        // connected, and that the target can outlive the session (and the app).
+        case calibrate = "Calibrate"
         var id: String { rawValue }
     }
     @Published var matchWorkflow: MatchWorkflow = .electronic
@@ -199,7 +206,14 @@ final class ArrayController: ObservableObject {
     /// One fixed production certification hold. Automatic mode advances
     /// immediately after this completes; Operator Proceed keeps focus on the
     /// matched camera until the operator explicitly continues.
-    let manualHoldSeconds: Double = 4.0
+    static let hybridHoldSeconds: Double = 4.0
+    /// Calibrate holds a second longer: the bench run advances on its own, so
+    /// the certification window is the only thing standing between a hand still
+    /// on the ring and a recorded roll row.
+    static let calibrationHoldSeconds: Double = 5.0
+    var manualHoldSeconds: Double {
+        calibrateMode ? Self.calibrationHoldSeconds : Self.hybridHoldSeconds
+    }
     @Published private(set) var manualPhase: ManualSessionPhase = .idle
     @Published private(set) var manualStatus: String = "Ready to capture a fixed target."
     @Published private(set) var manualTargetIRE: Double? = nil
@@ -207,6 +221,119 @@ final class ArrayController: ObservableObject {
     @Published private(set) var manualMatchedCount = 0
     @Published private(set) var manualArraySpreadStops: Double? = nil
     @Published private(set) var manualCommonDriftStops: Double? = nil
+
+    // MARK: Calibrate (single-body integrating-sphere bench)
+
+    /// Where the calibrate session's target IRE comes from.
+    ///
+    /// Two families, and the difference decides whether the operator dials:
+    ///
+    /// * ABSOLUTE (`gray18`, `custom`) — the number is known before the run.
+    ///   EVERY camera, including the first, is hand-dialed to it.
+    /// * MEASURED (`establish`, `pinned`) — the number comes from a reading.
+    ///   The establish camera is not dialed at all: what it reads IS the target,
+    ///   and it is pinned so the rest of the run matches that reading.
+    enum CalibrationTargetSource: String, CaseIterable, Identifiable {
+        /// 18% gray's anchor: 33.3 IRE through Log3G10, 42.3 through IPP2.
+        /// Absolute — dial every camera to it.
+        case gray18 = "18% gray"
+        /// First camera of the set defines the number: whatever it reads is the
+        /// target, pinned immediately so nothing after it drifts.
+        case establish = "Establish"
+        /// The stored reading. Every camera is dialed to match it.
+        case pinned = "Pinned"
+        /// Operator-entered IRE. Absolute — dial every camera to it.
+        case custom = "Custom"
+        var id: String { rawValue }
+
+        /// True when the number exists before the run and the first camera has
+        /// to be dialed like every other one.
+        var isAbsolute: Bool { self == .gray18 || self == .custom }
+    }
+
+    @Published var calibrationTargetSource: CalibrationTargetSource = .establish
+    @Published var calibrationTargetText: String = String(format: "%.1f", Log3G10.grayAnchorIRE)
+    /// The one camera the CURRENT calibrate session owns. The run walks the
+    /// queue one body at a time; each body gets its own full session so its
+    /// mirrored output is restored before the run moves on.
+    @Published private(set) var calibrationCameraID: UUID?
+    /// Every camera the run will visit, in IP order. Built once when the run
+    /// starts so hot-plugging a body mid-run cannot silently reorder it.
+    @Published private(set) var calibrationQueue: [UUID] = []
+    @Published private(set) var calibrationQueueIndex = 0
+    /// True while the focused camera is waiting for the operator to place and
+    /// approve its sphere mask. Unlocks fullscreen seeding mid-session.
+    @Published private(set) var calibrationAwaitingSeed = false
+    /// True while the post-hold IRE re-verification is in flight.
+    @Published private(set) var calibrationReverifying = false
+    /// Published, NOT derived from the task handle: `calibrationRunTask` is a
+    /// plain stored property, so flipping it would never notify SwiftUI and the
+    /// panel would keep showing run controls after the run ended.
+    @Published private(set) var calibrationRunActive = false
+    private var calibrationRunTask: Task<Void, Never>?
+    private var calibrationRunAbortRequested = false
+    private var calibrationReverifyTask: Task<Void, Never>?
+    private var calibrationReverifyGeneration: UInt64 = 0
+
+    /// A camera brought up AHEAD of its turn: local reader warm and mirrored
+    /// output already swapped to the calibration transform. The saved preset
+    /// travels with it so whoever ends up owning the camera — its own session,
+    /// or the run teardown — can put the output back.
+    struct CalibrationPrewarm {
+        var reading: MonitorTransformReading
+        var changed: Bool
+    }
+    private var calibrationPrewarmed: [UUID: CalibrationPrewarm] = [:]
+    private var calibrationPrewarmTask: Task<Void, Never>?
+    /// Published mirror of `calibrationPrewarmed`'s keys, for the tile badges.
+    @Published private(set) var calibrationPrewarmedIDs: Set<UUID> = []
+
+    /// How many cameras are made ready ahead of the one in the operator's hands.
+    /// NOTE: this raises the live local-decoder ceiling from 2 to 4. The trim
+    /// schedule caps itself at two readers on purpose (CPU + network); the bench
+    /// run deliberately spends that headroom so the operator never waits on a
+    /// stream wake between bodies.
+    static let calibrationPrewarmDepth = 3
+
+    /// How long a camera may sit waiting for its operator seed before the run
+    /// gives up on it. Generous: a human is walking to the next body.
+    static let calibrationSeedTimeout: TimeInterval = 600
+    /// Fresh native samples required by the post-hold IRE re-verification.
+    static let calibrationReverifySamples = 3
+
+    var calibrationRunTotal: Int { calibrationQueue.count }
+
+    /// Camera queued at `calibrationQueueIndex`, if it is still in the array.
+    var calibrationQueueNodes: [CameraNode] {
+        calibrationQueue.compactMap { id in nodes.first(where: { $0.id == id }) }
+    }
+    /// Persisted pinned reference + accumulating roll. Loaded at init.
+    @Published private(set) var calibrationPin: PinnedTarget?
+    @Published private(set) var calibrationRoll: [CalibrationRollRow] = []
+    let calibrationStore = CalibrationStore()
+
+    var calibrateMode: Bool { matchWorkflow == .calibrate }
+
+    /// Workflows that run the operator-in-the-loop session machinery and so
+    /// carry live OPEN/CLOSE guidance on the tiles. Hybrid trims the whole
+    /// array; Calibrate trims one body — the per-camera UI is identical.
+    var usesOperatorGuidance: Bool { matchWorkflow == .hybrid || calibrateMode }
+
+    /// Minimum participants a session needs. Calibrate is deliberately one.
+    private var minimumParticipants: Int { calibrateMode ? 1 : 2 }
+
+    var calibrationCustomTargetIRE: Double? {
+        guard let value = Double(calibrationTargetText.trimmingCharacters(in: .whitespaces)),
+              value > 0, value < 100,
+              Log3G10.linearize(value / 100.0) > 0 else { return nil }
+        return value
+    }
+
+    /// The camera a calibrate session is (or would be) run against.
+    var calibrationCamera: CameraNode? {
+        guard let id = calibrationCameraID else { return nil }
+        return nodes.first(where: { $0.id == id })
+    }
 
     // MARK: Live Sphere Soak
 
@@ -235,6 +362,15 @@ final class ArrayController: ObservableObject {
     /// the same four-second certification gate but never changes cameras until
     /// the operator presses the matched-only Proceed button.
     @Published var manualAdvanceMode: ManualAdvanceMode = .automatic
+    /// The advance mode the SESSION actually runs under. Calibrate is always
+    /// operator-driven — with one participant there is nothing to advance to,
+    /// so the automatic handoff must never fire — but forcing that by writing
+    /// to `manualAdvanceMode` would silently rewrite the operator's Hybrid
+    /// preference. Session logic reads this; the picker still owns the stored
+    /// value.
+    var effectiveAdvanceMode: ManualAdvanceMode {
+        calibrateMode ? .operatorProceed : manualAdvanceMode
+    }
     /// Cameras that have reached a held match and not since drifted out.
     private var manualCertified: Set<UUID> = []
     /// Final read-only quality proof for the currently focused camera. The
@@ -295,7 +431,7 @@ final class ArrayController: ObservableObject {
               manualParticipantIDs.contains(node.id) else {
             return
         }
-        if manualAdvanceMode == .operatorProceed,
+        if effectiveAdvanceMode == .operatorProceed,
            let currentID = fullScreenNodeID,
            currentID != node.id {
             let currentName = fullScreenNode.map(manualIDKey) ?? "Current camera"
@@ -484,6 +620,15 @@ final class ArrayController: ObservableObject {
         soak.onLog = { [weak self] line in self?.log(line) }
         soak.onDurationReached = { [weak self] in
             self?.stopSoak(reason: "duration reached")
+        }
+        let loaded = calibrationStore.load()
+        calibrationPin = loaded.pin
+        calibrationRoll = loaded.roll
+        // A pin that survived a relaunch is the whole point of pinning: default
+        // to using it rather than re-establishing against the next body.
+        if let pin = loaded.pin {
+            calibrationTargetSource = .pinned
+            calibrationTargetText = String(format: "%.1f", pin.ire)
         }
         startStreamWatchdog()
     }
@@ -1208,29 +1353,21 @@ final class ArrayController: ObservableObject {
         manualParticipantIDs.contains(node.id)
     }
 
-    /// Start a human-in-the-loop match session. Unlike the electronic loop,
-    /// this deliberately ignores APERTURE_CONTROL and never sends APERTURE.
-    /// Every connected + streaming participant must have a trusted sphere lock.
-    func startManualMatch() {
-        guard manualTask == nil, !loopRunning, !manualSessionActive,
-              !manualRestorePending, !qualityControlsLocked,
-              !qualityVerificationInProgress else { return }
-        guard manualTransform.isLog3G10 else {
-            manualPhase = .failed
-            manualStatus =
-                "Display (IPP2) stop guidance is not calibrated. Select Log3G10 for an exposure-accurate Manual Assist session."
-            return
-        }
-        guard manualTargetMode != .custom || manualCustomTargetIRE != nil else {
-            manualPhase = .failed
-            manualStatus = "Custom target must be a valid Log3G10 IRE between 0 and 100."
-            return
-        }
+    /// Shared precondition for starting ANY operator-in-the-loop session
+    /// (Hybrid or Calibrate). Owned reversible state — a pending output restore —
+    /// must be cleared before a new session may take ownership of more outputs.
+    private var canStartOperatorSession: Bool {
+        manualTask == nil && !loopRunning && !manualSessionActive
+            && !manualRestorePending && !qualityControlsLocked
+            && !qualityVerificationInProgress
+    }
 
-        matchWorkflow = .hybrid
+    /// Clear every per-session accumulator. Shared verbatim by Hybrid and
+    /// Calibrate so a mode can never inherit the other's residue.
+    private func resetOperatorSessionState(abortMessage: String) {
         manualEndRequested = false
         manualEndWasFailure = false
-        manualEndMessage = "Hybrid session aborted by operator."
+        manualEndMessage = abortMessage
         manualExpectedQuality = nil
         manualTargetIRE = nil
         manualParticipantCount = 0
@@ -1248,8 +1385,32 @@ final class ArrayController: ObservableObject {
         manualCertified.removeAll()
         invalidateManualCertificationQualityProof()
         manualEnteredTransformStage = false
+        calibrationAwaitingSeed = false
+        cancelCalibrationReverification()
         fullScreenNodeID = nil
         for node in nodes { node.manualMatch = ManualMatchInfo() }
+    }
+
+    /// Start a human-in-the-loop match session. Unlike the electronic loop,
+    /// this deliberately ignores APERTURE_CONTROL and never sends APERTURE.
+    /// Every connected + streaming participant must have a trusted sphere lock.
+    func startManualMatch() {
+        guard canStartOperatorSession else { return }
+        guard manualTransform.isLog3G10 else {
+            manualPhase = .failed
+            manualStatus =
+                "Display (IPP2) stop guidance is not calibrated. Select Log3G10 for an exposure-accurate Manual Assist session."
+            return
+        }
+        guard manualTargetMode != .custom || manualCustomTargetIRE != nil else {
+            manualPhase = .failed
+            manualStatus = "Custom target must be a valid Log3G10 IRE between 0 and 100."
+            return
+        }
+
+        matchWorkflow = .hybrid
+        calibrationCameraID = nil
+        resetOperatorSessionState(abortMessage: "Hybrid session aborted by operator.")
 
         manualPhase = .preparing
         manualStatus = "Checking streams, sphere locks, and mirrored outputs…"
@@ -1257,10 +1418,558 @@ final class ArrayController: ObservableObject {
         manualTask = Task { await runManualMatchSession() }
     }
 
+    // MARK: - Calibrate session (one body at a time)
+
+    /// Why the configured calibrate target cannot be used right now, or nil.
+    /// A pinned reference carries the monitoring transform it was captured
+    /// under: an IRE measured in Log3G10 is meaningless in IPP2, so a mismatch
+    /// must refuse rather than silently trim 36 bodies to the wrong number.
+    func calibrationTargetFailure() -> String? {
+        switch calibrationTargetSource {
+        case .gray18, .establish:
+            return nil
+        case .pinned:
+            guard let pin = calibrationPin else {
+                return "No pinned reference yet. Establish one on the first camera, then pin it."
+            }
+            guard pin.transform == manualTransform.rawValue else {
+                return "Pinned reference was captured in \(pin.transform); this session is set to \(manualTransform.rawValue). Re-pin or switch monitoring."
+            }
+            return nil
+        case .custom:
+            guard calibrationCustomTargetIRE != nil else {
+                return "Custom target must be a valid Log3G10 IRE between 0 and 100."
+            }
+            return nil
+        }
+    }
+
+    /// Numeric IP sort key. Lexical ordering puts `.9` after `.10`, which would
+    /// walk a 36-body bench in the wrong sequence — the operator is following
+    /// the run down a physical row of cameras.
+    private func ipSortKey(_ node: CameraNode) -> UInt32 {
+        let octets = node.ip.split(separator: ".").compactMap { UInt32($0) }
+        guard octets.count == 4, octets.allSatisfy({ $0 < 256 }) else { return .max }
+        return octets[0] << 24 | octets[1] << 16 | octets[2] << 8 | octets[3]
+    }
+
+    /// Connected cameras in the order the run will visit them.
+    var calibrationRunOrder: [CameraNode] {
+        nodes.filter(\.connected).sorted { ipSortKey($0) < ipSortKey($1) }
+    }
+
+    /// True when a calibration run can start right now.
+    var canBeginCalibrationRun: Bool {
+        calibrateMode && canStartOperatorSession && !calibrationRunActive
+            && manualTransform.isLog3G10 && !calibrationRunOrder.isEmpty
+            && calibrationTargetFailure() == nil
+    }
+
+    /// Whether the run can be started FROM this camera (tile + fullscreen).
+    func canStartRunHere(_ node: CameraNode) -> Bool {
+        canBeginCalibrationRun && node.connected
+    }
+
+    /// Start the run. ONE press: the queue is every connected camera in IP
+    /// order, and the run walks it — seed, trim, hold, re-verify, next — until
+    /// the set is done or something stops it. `startingAt` lets the operator
+    /// pick the run up mid-row instead of always from the lowest IP.
+    func beginCalibrationRun(startingAt node: CameraNode? = nil) {
+        guard canStartOperatorSession, !calibrationRunActive else { return }
+        matchWorkflow = .calibrate
+        guard manualTransform.isLog3G10 else {
+            manualPhase = .failed
+            manualStatus =
+                "Display (IPP2) stop guidance is not calibrated. Select Log3G10 before calibrating."
+            return
+        }
+        if let failure = calibrationTargetFailure() {
+            manualPhase = .failed
+            manualStatus = failure
+            return
+        }
+        let ordered = calibrationRunOrder
+        guard !ordered.isEmpty else {
+            manualPhase = .failed
+            manualStatus = "No connected cameras to calibrate."
+            return
+        }
+        calibrationQueue = ordered.map(\.id)
+        calibrationQueueIndex = node
+            .flatMap { n in ordered.firstIndex(where: { $0.id == n.id }) } ?? 0
+        calibrationRunAbortRequested = false
+        calibrationRunActive = true
+        log("calibrate: RUN START — \(ordered.count) camera(s) in IP order: "
+            + ordered.map(\.ip).joined(separator: " → "))
+        soak.recordMatchEvent("calibration_run_start",
+                              detail: "\(ordered.count) cameras in IP order")
+        calibrationRunTask = Task { await runCalibrationRun() }
+    }
+
+    /// Stop the run after (or during) the camera currently in hand. The current
+    /// camera's output preset is still restored — this never abandons owned
+    /// reversible state.
+    func stopCalibrationRun() {
+        guard calibrationRunActive else { return }
+        calibrationRunAbortRequested = true
+        calibrationPrewarmTask?.cancel()
+        log("calibrate: run stop requested")
+        if manualSessionActive { abortManualMatch() }
+    }
+
+    /// The run loop. Each camera gets a COMPLETE session of its own — preflight,
+    /// Log3G10 swap, seed, baseline, trim, certify, re-verify, restore — so a
+    /// body is fully put back before the operator's hands move to the next one.
+    private func runCalibrationRun() async {
+        while !calibrationRunAbortRequested,
+              calibrationQueueIndex < calibrationQueue.count {
+            let id = calibrationQueue[calibrationQueueIndex]
+            guard let node = nodes.first(where: { $0.id == id }), node.connected else {
+                log("calibrate: queue position \(calibrationQueueIndex + 1) is no longer connected — skipping")
+                calibrationQueueIndex += 1
+                continue
+            }
+            startCalibrationCamera(node)
+            guard let task = manualTask else {
+                log("calibrate: could not start \(manualIDKey(node)) — run halted")
+                break
+            }
+            await task.value
+            // closeManualMatch() clears manualEndWasFailure, so the phase it
+            // leaves behind is the reliable outcome signal.
+            if manualPhase == .failed || manualRestorePending {
+                log("calibrate: RUN HALTED at \(manualIDKey(node)) — \(manualStatus)")
+                break
+            }
+            if calibrationRunAbortRequested { break }
+            calibrationQueueIndex += 1
+        }
+
+        await restorePrewarmedCalibrationCameras()
+        let done = min(calibrationQueueIndex, calibrationQueue.count)
+        let finishedAll = done >= calibrationQueue.count && !calibrationRunAbortRequested
+        manualStatus = finishedAll
+            ? "Calibration run complete — \(calibrationRoll.count) camera(s) in the roll. Save the roll when ready."
+            : "Run stopped after \(done) of \(calibrationQueue.count) camera(s). \(manualStatus)"
+        log("calibrate: RUN END — \(done)/\(calibrationQueue.count) camera(s)")
+        soak.recordMatchEvent("calibration_run_end",
+                              detail: "\(done)/\(calibrationQueue.count) cameras")
+        calibrationRunAbortRequested = false
+        calibrationRunActive = false
+        calibrationAwaitingSeed = false
+        calibrationRunTask = nil
+    }
+
+    // MARK: Calibrate — look-ahead prewarm
+
+    /// The next `limit` connected cameras the run will visit.
+    private func upcomingCalibrationCameras(limit: Int) -> [CameraNode] {
+        var result: [CameraNode] = []
+        var index = calibrationQueueIndex + 1
+        while index < calibrationQueue.count, result.count < limit {
+            if let node = nodes.first(where: { $0.id == calibrationQueue[index] }),
+               node.connected {
+                result.append(node)
+            }
+            index += 1
+        }
+        return result
+    }
+
+    /// Kick the look-ahead. Called once the CURRENT camera reaches trimming —
+    /// deliberately not earlier, because a session's own preflight parks every
+    /// stream in the array and would tear down anything warmed before it.
+    private func startCalibrationPrewarm() {
+        guard calibrationRunActive else { return }
+        calibrationPrewarmTask?.cancel()
+        let targets = upcomingCalibrationCameras(limit: Self.calibrationPrewarmDepth)
+            .filter { calibrationPrewarmed[$0.id] == nil }
+        guard !targets.isEmpty else { return }
+        calibrationPrewarmTask = Task { [weak self] in
+            guard let self else { return }
+            for node in targets {
+                if Task.isCancelled || !self.calibrationRunActive { return }
+                await self.prewarmCalibrationCamera(node)
+            }
+        }
+    }
+
+    /// Bring one upcoming camera to the state its session would otherwise have
+    /// to build from cold: local reader warm, mirrored output in the calibration
+    /// transform, original preset remembered.
+    private func prewarmCalibrationCamera(_ node: CameraNode) async {
+        guard calibrationPrewarmed[node.id] == nil, node.connected else { return }
+        transitionManualStreamRole(node, to: .warm, now: Date())
+        guard manualTransform.isLog3G10, let camera = node.camera else { return }
+
+        let reading = await camera.readActiveMonitorTransform()
+        guard !Task.isCancelled, calibrationRunActive,
+              !reading.parameterID.isEmpty, let before = reading.presetValue else {
+            return
+        }
+        var changed = false
+        if before != RCP2.log3G10DisplayPresetValue {
+            changed = await camera.setMonitorDisplayPreset(
+                parameterID: reading.parameterID,
+                value: RCP2.log3G10DisplayPresetValue,
+                reason: "calibrate prewarm Log3G10"
+            )
+            guard changed else {
+                log("calibrate: prewarm could not set Log3G10 on \(node.ip) — the run will set it on arrival")
+                return
+            }
+        }
+        calibrationPrewarmed[node.id] = CalibrationPrewarm(reading: reading, changed: changed)
+        calibrationPrewarmedIDs.insert(node.id)
+        log("calibrate: prewarmed \(manualIDKey(node)) — reader warm, \(changed ? "Log3G10 set" : "already Log3G10")")
+    }
+
+    /// Hand a prewarmed camera's owned state to the session about to run it, so
+    /// the session's normal restore path covers it. Without this the session
+    /// would read the output, find it ALREADY Log3G10, and save that as the
+    /// "original" — restoring the camera to Log3G10 instead of its own preset.
+    private func adoptCalibrationPrewarm(_ node: CameraNode) {
+        guard let pre = calibrationPrewarmed.removeValue(forKey: node.id) else { return }
+        calibrationPrewarmedIDs.remove(node.id)
+        manualSavedTransforms[node.id] = pre.reading
+        if pre.changed { manualChangedOutputs.insert(node.id) }
+    }
+
+    /// Put back every output the look-ahead touched but the run never reached.
+    private func restorePrewarmedCalibrationCameras() async {
+        calibrationPrewarmTask?.cancel()
+        calibrationPrewarmTask = nil
+        guard !calibrationPrewarmed.isEmpty else { return }
+        for (id, pre) in calibrationPrewarmed {
+            guard let node = nodes.first(where: { $0.id == id }) else {
+                calibrationPrewarmed.removeValue(forKey: id)
+                continue
+            }
+            if pre.changed, let camera = node.camera {
+                if await camera.restoreMonitorTransform(pre.reading) {
+                    log("calibrate: restored prewarmed output on \(manualIDKey(node))")
+                    calibrationPrewarmed.removeValue(forKey: id)
+                } else {
+                    log("calibrate: FAILED to restore prewarmed output on \(node.ip) — check its Look by hand")
+                }
+            } else {
+                calibrationPrewarmed.removeValue(forKey: id)
+            }
+            transitionManualStreamRole(node, to: .parked, now: Date())
+        }
+        calibrationPrewarmedIDs = Set(calibrationPrewarmed.keys)
+    }
+
+    /// Open one camera's session. Called only by the run loop.
+    private func startCalibrationCamera(_ node: CameraNode) {
+        guard canStartOperatorSession else { return }
+        resetOperatorSessionState(abortMessage: "Calibration aborted by operator.")
+        // AFTER the reset (which clears the transform bookkeeping), take over
+        // whatever the look-ahead already did to this body.
+        adoptCalibrationPrewarm(node)
+        calibrationCameraID = node.id
+        // One body owns the screen for its whole session.
+        selectedNodeID = node.id
+        fullScreenNodeID = node.id
+        manualPhase = .preparing
+        manualStatus = String(
+            format: "%@ (%d/%d): waking stream…",
+            manualIDKey(node), calibrationQueueIndex + 1, calibrationQueue.count)
+        qualityControlsLocked = true
+        log("calibrate: \(manualIDKey(node)) [\(node.ip)] — camera \(calibrationQueueIndex + 1)/\(calibrationQueue.count), target source \(calibrationTargetSource.rawValue)")
+        manualTask = Task { await runManualMatchSession() }
+    }
+
+    /// Leave this body un-calibrated and let the run continue. Ends the session
+    /// cleanly (phase .finished, output restored), so the run loop advances.
+    func skipCalibrationCamera() {
+        guard calibrationRunActive, manualTask != nil, manualSessionActive else { return }
+        cancelCalibrationReverification()
+        manualEndWasFailure = false
+        manualEndMessage = "Camera skipped by operator."
+        manualEndRequested = true
+        manualPhase = .restoring
+        manualStatus = "Skipping — restoring the saved output preset…"
+        log("calibrate: \(calibrationCamera.map(manualIDKey) ?? "camera") skipped by operator")
+    }
+
+    /// End the current camera's session and restore its saved output preset.
+    /// The roll row is committed by the IRE re-verification, so this never
+    /// carries data-loss risk — it is purely "put this camera back".
+    func finishCalibration() {
+        guard manualTask != nil, calibrateMode,
+              manualPhase == .trimming || manualPhase == .complete else { return }
+        manualEndWasFailure = false
+        manualEndMessage = manualCertified.isEmpty
+            ? "Calibration ended before the camera certified."
+            : "Calibration recorded."
+        manualEndRequested = true
+        manualPhase = .restoring
+        manualStatus = "Restoring the saved output preset…"
+        log("calibrate: finish requested")
+    }
+
+    // MARK: Calibrate — pinned reference
+
+    var canPinCalibrationTarget: Bool {
+        calibrateMode && manualTargetIRE != nil
+            && (manualPhase == .trimming || manualPhase == .complete)
+    }
+
+    /// Operator entry point: pin whatever the live session is targeting.
+    func pinCalibrationTarget() {
+        guard let target = manualTargetIRE, target.isFinite else { return }
+        pinCalibrationTarget(target, reason: "operator")
+    }
+
+    /// Freeze `target` as THE reference for the run and write it to disk.
+    /// Everything after this trims to the same number, including after a
+    /// relaunch. Flipping the source to .pinned is load-bearing: it is what
+    /// stops the next camera re-establishing against itself.
+    func pinCalibrationTarget(_ target: Double, reason: String) {
+        guard target.isFinite else { return }
+        let source = calibrationCamera.map(manualIDKey) ?? ""
+        let pin = PinnedTarget(
+            ire: target,
+            transform: manualTransform.rawValue,
+            capturedAt: Date(),
+            sourceCameraID: source,
+            toleranceStops: manualToleranceStops
+        )
+        calibrationPin = pin
+        calibrationTargetSource = .pinned
+        calibrationTargetText = String(format: "%.1f", target)
+        calibrationStore.savePin(pin, roll: calibrationRoll)
+        log(String(format: "calibrate: PINNED target %.3f IRE (%@) from %@ [%@]",
+                   target, manualTransform.rawValue,
+                   source.isEmpty ? "—" : source, reason))
+        soak.recordMatchEvent("calibration_target_pinned",
+                              detail: String(format: "%.3f IRE (%@) from %@ [%@]",
+                                             target, manualTransform.rawValue,
+                                             source.isEmpty ? "—" : source, reason))
+    }
+
+    /// The establish camera is where the number is CHOSEN. Dial it to the level
+    /// you want on the sphere, then commit that live reading as the run's
+    /// target — this re-points and re-pins in one move, and resets the hold so
+    /// the camera must certify against the NEW number.
+    var canSetCalibrationTargetFromLive: Bool {
+        calibrateMode && manualPhase == .trimming
+            && (calibrationCamera?.manualMatch.currentIRE
+                ?? calibrationCamera?.sphere.heroIRE) != nil
+    }
+
+    func setCalibrationTargetFromLive() {
+        guard calibrateMode, manualPhase == .trimming,
+              let node = calibrationCamera,
+              let live = node.manualMatch.currentIRE ?? node.sphere.heroIRE,
+              live.isFinite, live > 0, live < 100,
+              Log3G10.linearize(live / 100.0) > 0 else { return }
+        cancelCalibrationReverification()
+        invalidateManualCertificationQualityProof()
+        manualCertified.removeAll()
+        manualMatchedCount = 0
+        manualStableSince.removeAll()
+        manualTargetIRE = live
+        for n in manualParticipants {
+            n.manualMatch.targetIRE = live
+            n.manualMatch.stability = 0
+            n.manualMatch.detail = "target re-pointed to live reading"
+        }
+        pinCalibrationTarget(live, reason: "set from live")
+        manualStatus = String(format: "Target set to %.2f IRE from %@ — hold it to certify.",
+                              live, manualIDKey(node))
+        log(String(format: "calibrate: run target COMMITTED at %.3f IRE from %@",
+                   live, manualIDKey(node)))
+    }
+
+    func clearCalibrationPin() {
+        guard calibrationPin != nil else { return }
+        calibrationPin = nil
+        if calibrationTargetSource == .pinned { calibrationTargetSource = .establish }
+        calibrationStore.savePin(nil, roll: calibrationRoll)
+        log("calibrate: pinned target cleared")
+    }
+
+    // MARK: Calibrate — post-hold IRE re-verification
+
+    /// The gate between "held steady" and "recorded". The certification hold
+    /// proves the lens stopped moving; it does NOT prove the number is still
+    /// right — a hand resting on the ring, a late AE twitch, or a sphere that
+    /// drifted during the hold all survive it. So after the hold, throw away
+    /// every cached sample and require `calibrationReverifySamples` brand-new
+    /// native measurements whose median is still inside tolerance.
+    ///
+    /// Pass  → commit the roll row (at the re-verified value) and end the
+    ///         camera's session, which lets the run advance.
+    /// Fail  → withdraw certification and drop back to live OPEN/CLOSE guidance
+    ///         on the same camera. The run never moves on from a bad reading.
+    private func requestCalibrationIREReverification(for node: CameraNode,
+                                                     target: Double) {
+        guard calibrationReverifyTask == nil, !calibrationReverifying else { return }
+        calibrationReverifyGeneration &+= 1
+        let generation = calibrationReverifyGeneration
+        let nodeID = node.id
+        let name = manualIDKey(node)
+        let epoch = Date()
+        calibrationReverifying = true
+        manualStatus = "\(name): re-verifying IRE…"
+        node.manualMatch.detail = "re-verifying IRE"
+        log("calibrate: \(name) hold complete — re-verifying IRE against \(String(format: "%.2f", target))")
+        calibrationReverifyTask = Task { [weak self] in
+            guard let self else { return }
+            let samples = await self.collectManualSamples(
+                node,
+                after: epoch,
+                count: Self.calibrationReverifySamples,
+                timeout: Self.manualReadyGrace
+            )
+            // The 20 Hz guidance loop keeps running underneath this await. If
+            // the reading fell out of the band while we were sampling, it will
+            // already have withdrawn the certification — in which case this
+            // result is stale and must NOT record or advance.
+            guard !Task.isCancelled,
+                  self.calibrationReverifyGeneration == generation,
+                  self.manualPhase == .trimming,
+                  self.fullScreenNodeID == nodeID,
+                  self.manualCertified.contains(nodeID) else {
+                self.calibrationReverifyTask = nil
+                self.calibrationReverifying = false
+                return
+            }
+            self.calibrationReverifyTask = nil
+            self.calibrationReverifying = false
+
+            guard let samples, let measured = self.median(samples) else {
+                self.failCalibrationReverification(
+                    node, name: name,
+                    reason: "no fresh measurements arrived")
+                return
+            }
+            let correction = Log3G10.stops(between: target, and: measured)
+            guard correction.isFinite,
+                  abs(correction) <= self.manualToleranceStops else {
+                self.failCalibrationReverification(
+                    node, name: name,
+                    reason: String(format: "re-measured %.2f IRE (%+.3f stop)",
+                                   measured, correction))
+                return
+            }
+            self.log(String(format: "calibrate: %@ RE-VERIFIED at %.2f IRE (%+.3f stop) — recording",
+                            name, measured, correction))
+            self.recordCalibrationRow(node, target: target, measuredIRE: measured)
+            self.finishCalibration()
+        }
+    }
+
+    /// Drop an in-flight re-verification (the reading moved, or focus changed).
+    private func cancelCalibrationReverification() {
+        guard calibrationReverifyTask != nil || calibrationReverifying else { return }
+        calibrationReverifyGeneration &+= 1
+        calibrationReverifyTask?.cancel()
+        calibrationReverifyTask = nil
+        calibrationReverifying = false
+    }
+
+    /// Re-verification failed: pull the certification and put the operator back
+    /// on the ring. The run stays on this camera.
+    private func failCalibrationReverification(_ node: CameraNode,
+                                               name: String,
+                                               reason: String) {
+        manualCertified.remove(node.id)
+        manualMatchedCount = manualCertified.count
+        manualStableSince.removeValue(forKey: node.id)
+        invalidateManualCertificationQualityProof()
+        node.manualMatch.stability = 0
+        node.manualMatch.phase = .acquiring
+        node.manualMatch.detail = "re-verify failed — keep trimming"
+        manualStatus = "\(name): IRE re-verify FAILED — \(reason). Keep trimming."
+        log("calibrate: \(name) re-verify FAILED — \(reason)")
+        soak.recordMatchEvent("calibration_reverify_failed", cameraIP: node.ip,
+                              detail: reason)
+    }
+
+    // MARK: Calibrate — the roll
+
+    /// Commit one certified camera. Called from the single certification site
+    /// in updateManualMatch, which fires exactly once per focused camera.
+    private func recordCalibrationRow(_ node: CameraNode, target: Double,
+                                      measuredIRE: Double) {
+        let id = manualIDKey(node)
+        let current = measuredIRE
+        guard current.isFinite else {
+            log("calibrate: \(id) certified but carried no usable IRE — not recorded")
+            return
+        }
+        let correction = Log3G10.stops(between: target, and: current)
+        let still = calibrationStore.writeStill(node.stream.frame, displayID: id)
+        let row = CalibrationRollRow(
+            displayID: id,
+            ip: node.ip,
+            serial: node.status.serial,
+            finalIRE: current,
+            targetIRE: target,
+            deltaIRE: current - target,
+            // JSONEncoder throws on non-conforming floats, so a degenerate
+            // measurement must never reach the document.
+            correctionStops: correction.isFinite ? correction : 0,
+            stopLabel: RCP2.stopLabel(node.status.apertureCur),
+            certifiedAt: Date(),
+            stillFilename: still ?? "",
+            sphereCX: node.sphere.cx,
+            sphereCY: node.sphere.cy,
+            sphereR: node.sphere.r
+        )
+        calibrationRoll.upsert(row)
+        calibrationStore.saveRoll(calibrationRoll, pin: calibrationPin)
+        log(String(format: "calibrate: recorded %@ at %.2f IRE (%+.3f stop, T %@) — roll now %d camera(s)",
+                   id, current, row.correctionStops, row.stopLabel, calibrationRoll.count))
+        soak.recordMatchEvent("calibration_row_recorded", cameraIP: node.ip,
+                              detail: String(format: "%.2f IRE; %+.3f stop; T %@",
+                                             current, row.correctionStops, row.stopLabel))
+    }
+
+    /// Whether this camera is already in the roll — drives the tile badge so an
+    /// operator working through 36 bodies can see what is done at a glance.
+    func isInCalibrationRoll(_ node: CameraNode) -> Bool {
+        calibrationRoll.contains { $0.displayID == manualIDKey(node) }
+    }
+
+    var calibrationRollSpreadStops: Double? { calibrationRoll.spreadStops }
+
+    func clearCalibrationRoll() {
+        guard !calibrationRoll.isEmpty else { return }
+        let count = calibrationRoll.count
+        calibrationRoll.removeAll()
+        calibrationStore.deleteStills()
+        calibrationStore.saveRoll(calibrationRoll, pin: calibrationPin)
+        log("calibrate: roll cleared (\(count) camera(s))")
+    }
+
+    /// Render and save the whole run as one paginated PDF.
+    func saveCalibrationRoll() {
+        guard !calibrationRoll.isEmpty else { return }
+        let model = CalibrationRollReport.model(
+            rows: calibrationRoll,
+            pin: calibrationPin,
+            transform: manualTransform.rawValue,
+            toleranceStops: manualToleranceStops,
+            store: calibrationStore
+        )
+        guard let url = CalibrationRollReport.promptAndWrite(model) else {
+            log("calibrate: roll report save cancelled")
+            return
+        }
+        log("calibrate: roll report saved → \(url.lastPathComponent)")
+        soak.recordMatchEvent("calibration_roll_saved", detail: url.path)
+    }
+
     func abortManualMatch() {
         guard manualTask != nil, manualSessionActive else { return }
         manualEndWasFailure = false
-        manualEndMessage = "Manual Assist aborted by operator."
+        manualEndMessage = calibrateMode
+            ? "Calibration aborted by operator."
+            : "Manual Assist aborted by operator."
         manualEndRequested = true
         manualPhase = .restoring
         manualStatus = "Stopping guidance and restoring saved output presets…"
@@ -1323,6 +2032,17 @@ final class ArrayController: ObservableObject {
         log("manual match: finish + report requested")
     }
 
+    /// Who this session owns. Hybrid takes every connected body (the array IS
+    /// the participant set). Calibrate takes exactly the one camera the operator
+    /// chose, so the other 35 may stay connected on the subnet without joining.
+    private func sessionParticipants() -> [CameraNode] {
+        guard calibrateMode else { return nodes.filter(\.connected) }
+        guard let id = calibrationCameraID,
+              let node = nodes.first(where: { $0.id == id }),
+              node.connected else { return [] }
+        return [node]
+    }
+
     private func runManualMatchSession() async {
         guard !manualEndRequested else {
             await closeManualMatch()
@@ -1333,34 +2053,47 @@ final class ArrayController: ObservableObject {
         // and an enabled livestream intent, but Capture + Start deliberately does
         // NOT keep every HTTP reader live. It parks them, then wakes one camera at
         // a time for transform verification and baseline capture.
-        let parts = nodes.filter(\.connected)
-        guard parts.count >= 2 else {
-            await failManualMatch("Need at least two connected cameras for Manual Assist.")
+        let parts = sessionParticipants()
+        guard parts.count >= minimumParticipants else {
+            await failManualMatch(calibrateMode
+                ? "Select a connected camera to calibrate."
+                : "Need at least two connected cameras for Manual Assist.")
             return
         }
+        // Calibrate seeds each body when the run reaches it, so a solved sphere
+        // is NOT a precondition here — only an enabled stream is. Hybrid keeps
+        // its original contract: everything solved before Capture + Start.
         let unsolved = parts.filter {
-            !$0.sphere.measurable || !$0.streamingDesired
+            calibrateMode ? !$0.streamingDesired
+                          : (!$0.sphere.measurable || !$0.streamingDesired)
         }
         guard unsolved.isEmpty else {
-            await failManualMatch(
-                "Lock a measurable sphere and start its stream before Capture + Start on: " +
+            await failManualMatch(calibrateMode
+                ? "Start the livestream on \(unsolved.map(\.displayName).joined(separator: ", ")) before calibrating."
+                : "Lock a measurable sphere and start its stream before Capture + Start on: " +
                     unsolved.map(\.displayName).joined(separator: ", ")
             )
             return
         }
-        let freshnessEpoch = Date()
-        let staleSolve = parts.filter { node in
-            guard let measuredAt = node.sphere.measuredAt else { return true }
-            return freshnessEpoch.timeIntervalSince(measuredAt)
-                > Self.manualSolveFreshness
-        }
-        guard staleSolve.isEmpty else {
-            await failManualMatch(
-                "Sphere solve is no longer fresh on: "
-                    + staleSolve.map(\.displayName).joined(separator: ", ")
-                    + ". Wake/re-solve those cameras, then Capture + Start."
-            )
-            return
+        // The freshness gate exists because Hybrid freezes N already-solved ROIs
+        // at once and must not sample a stale one. Calibrate measures the body
+        // in hand, immediately after its own seed, so there is nothing stale to
+        // catch — and enforcing it here would reject every unseeded camera.
+        if !calibrateMode {
+            let freshnessEpoch = Date()
+            let staleSolve = parts.filter { node in
+                guard let measuredAt = node.sphere.measuredAt else { return true }
+                return freshnessEpoch.timeIntervalSince(measuredAt)
+                    > Self.manualSolveFreshness
+            }
+            guard staleSolve.isEmpty else {
+                await failManualMatch(
+                    "Sphere solve is no longer fresh on: "
+                        + staleSolve.map(\.displayName).joined(separator: ", ")
+                        + ". Wake/re-solve those cameras, then Capture + Start."
+                )
+                return
+            }
         }
 
         manualParticipantIDs = Set(parts.map(\.id))
@@ -1378,6 +2111,13 @@ final class ArrayController: ObservableObject {
         // RCP sessions are fresh; parking touches neither of them.
         let parkEpoch = Date()
         for node in nodes where node.streamingDesired || node.stream.isStreaming {
+            // Cameras the look-ahead warmed are exempt: parking them here is
+            // exactly the wait this run exists to remove. So is THIS session's
+            // own camera — it was just adopted out of the prewarm set, and
+            // parking it would throw away the wake we paid for one camera ago.
+            if calibrateMode,
+               calibrationPrewarmedIDs.contains(node.id)
+                || manualParticipantIDs.contains(node.id) { continue }
             transitionManualStreamRole(node, to: .parked, now: parkEpoch)
         }
 
@@ -1429,6 +2169,21 @@ final class ArrayController: ObservableObject {
                 "\(node.displayName): waking stream \(index + 1)/\(ordered.count)…"
             let wakeEpoch = Date()
             transitionManualStreamRole(node, to: .focused, now: wakeEpoch)
+            // The run's seed gate. The body is on screen and streaming; the
+            // operator places and approves its mask now, and only then does the
+            // measurement path have anything to prove.
+            if calibrateMode, !node.sphere.measurable {
+                guard await waitForOperatorSeed(node) else {
+                    if manualEndRequested {
+                        await closeManualMatch()
+                    } else {
+                        await failManualMatch(
+                            "\(node.displayName) was never given a sphere mask. Click the sphere centre in fullscreen, size the mask, and Approve."
+                        )
+                    }
+                    return
+                }
+            }
             guard await waitForManualCameraReady(node, after: wakeEpoch) else {
                 if manualEndRequested {
                     await closeManualMatch()
@@ -1476,7 +2231,12 @@ final class ArrayController: ObservableObject {
                     )
                     return
                 }
-                manualSavedTransforms[node.id] = reading
+                // Only record the ORIGINAL. If the look-ahead already swapped
+                // this output, `reading` is the swapped state and saving it
+                // would restore the camera to Log3G10 instead of its own preset.
+                if manualSavedTransforms[node.id] == nil {
+                    manualSavedTransforms[node.id] = reading
+                }
                 if before != RCP2.log3G10DisplayPresetValue {
                     manualChangedOutputs.insert(node.id)
                     let ok = await camera.setMonitorDisplayPreset(
@@ -1557,14 +2317,45 @@ final class ArrayController: ObservableObject {
         manualEnteredTransformStage = manualTransform.isLog3G10
 
         let rawTarget: Double
-        switch manualTargetMode {
-        case .median:
-            rawTarget = median(Array(baselines.values)) ?? 0
-        case .gray18:
-            // 18% gray anchors at 33.3 IRE in Log3G10, 42.3 IRE in IPP2.
-            rawTarget = manualTransform.isLog3G10 ? Log3G10.grayAnchorIRE : Self.ipp2GrayAnchorIRE
-        case .custom:
-            rawTarget = manualCustomTargetIRE ?? 0
+        if calibrateMode {
+            // Calibrate resolves its target from the persisted reference chain,
+            // NOT from manualTargetMode. Establish uses this camera's own
+            // baseline (median of a one-element set is that element), which is
+            // exactly "camera 1 defines the number for the whole run".
+            switch calibrationTargetSource {
+            case .gray18:
+                // Absolute anchor — no reading involved, so nothing to pin.
+                rawTarget = manualTransform.isLog3G10
+                    ? Log3G10.grayAnchorIRE : Self.ipp2GrayAnchorIRE
+            case .establish:
+                // First camera of the run only. Resolving this a second time
+                // would target each body at its own baseline — every camera
+                // "matched", nothing actually matching. The pin written below
+                // flips the source to .pinned so this branch cannot run twice.
+                rawTarget = median(Array(baselines.values)) ?? 0
+            case .pinned:
+                guard let pin = calibrationPin,
+                      pin.transform == manualTransform.rawValue else {
+                    await failManualMatch(
+                        calibrationTargetFailure()
+                            ?? "Pinned reference is unavailable for this monitoring transform."
+                    )
+                    return
+                }
+                rawTarget = pin.ire
+            case .custom:
+                rawTarget = calibrationCustomTargetIRE ?? 0
+            }
+        } else {
+            switch manualTargetMode {
+            case .median:
+                rawTarget = median(Array(baselines.values)) ?? 0
+            case .gray18:
+                // 18% gray anchors at 33.3 IRE in Log3G10, 42.3 IRE in IPP2.
+                rawTarget = manualTransform.isLog3G10 ? Log3G10.grayAnchorIRE : Self.ipp2GrayAnchorIRE
+            case .custom:
+                rawTarget = manualCustomTargetIRE ?? 0
+            }
         }
         // Preserve the captured/calibrated target at full precision for all stop
         // math. Manual operation does not require landing the displayed decimal:
@@ -1584,6 +2375,18 @@ final class ArrayController: ObservableObject {
         }
 
         manualTargetIRE = target
+        // Fix the run's reference the moment it is first resolved, and write it
+        // through, so the rest of the run (and a relaunch mid-run) cannot drift
+        // onto a different number. Re-pointable while still on this camera via
+        // setCalibrationTargetFromLive().
+        // Establish: this camera's reading IS the number, so it is pinned the
+        // instant it resolves and the camera is NOT dialed — it holds,
+        // re-verifies and records exactly like the rest. Absolute sources
+        // (18% gray / custom) are never pinned: the number did not come from a
+        // reading, and overwriting the stored pin with it would be a lie.
+        if calibrateMode, calibrationTargetSource == .establish {
+            pinCalibrationTarget(target, reason: "established")
+        }
         for node in parts {
             let baseline = baselines[node.id]
             node.manualMatch = ManualMatchInfo(
@@ -1597,13 +2400,34 @@ final class ArrayController: ObservableObject {
                 detail: "fixed target captured")
         }
         manualPhase = .trimming
-        fullScreenNodeID = nil
-        manualStatus = String(format: "Target locked at %.0f IRE — select a camera and trim its lens.", target)
-        log(String(format: "manual match: START — %d cameras, fixed target %.2f IRE, tolerance ±%.3f stop, hold %.1fs",
-                   parts.count, target, manualToleranceStops, manualHoldSeconds))
-        soak.recordMatchEvent("manual_match_start",
-                              detail: String(format: "%d cameras; target %.2f IRE; tolerance %.3f stop",
-                                             parts.count, target, manualToleranceStops))
+        if calibrateMode, let only = parts.first {
+            // One body: it keeps the screen and the focused stream role, so
+            // OPEN/CLOSE guidance is live the instant the target resolves.
+            selectedNodeID = only.id
+            fullScreenNodeID = only.id
+            applyManualStreamSchedule(parts)
+            // Hands are now on this lens, which is the slack the look-ahead
+            // needs to bring the next few bodies up behind it.
+            startCalibrationPrewarm()
+            manualStatus = String(
+                format: "Target %.1f IRE (%@) — dial the aperture on %@.",
+                target, calibrationTargetSource.rawValue.lowercased(), manualIDKey(only))
+            log(String(format: "calibrate: START — %@, target %.2f IRE (%@), tolerance ±%.3f stop, hold %.1fs",
+                       manualIDKey(only), target, calibrationTargetSource.rawValue,
+                       manualToleranceStops, manualHoldSeconds))
+            soak.recordMatchEvent("calibrate_start", cameraIP: only.ip,
+                                  detail: String(format: "target %.2f IRE (%@); tolerance %.3f stop",
+                                                 target, calibrationTargetSource.rawValue,
+                                                 manualToleranceStops))
+        } else {
+            fullScreenNodeID = nil
+            manualStatus = String(format: "Target locked at %.0f IRE — select a camera and trim its lens.", target)
+            log(String(format: "manual match: START — %d cameras, fixed target %.2f IRE, tolerance ±%.3f stop, hold %.1fs",
+                       parts.count, target, manualToleranceStops, manualHoldSeconds))
+            soak.recordMatchEvent("manual_match_start",
+                                  detail: String(format: "%d cameras; target %.2f IRE; tolerance %.3f stop",
+                                                 parts.count, target, manualToleranceStops))
+        }
 
         while !manualEndRequested {
             updateManualMatch(parts)
@@ -1632,6 +2456,27 @@ final class ArrayController: ObservableObject {
     /// Wait for a locally-woken camera to prove the full measurement path: live
     /// HTTP transport plus three new native-frame ROI readings. A cached sphere
     /// value from the solve pass cannot satisfy this gate.
+    /// Hold the run on this camera until the operator approves a sphere mask.
+    /// Publishes `calibrationAwaitingSeed` so fullscreen re-enables click-to-seed
+    /// for the focused body — seeding is otherwise locked out mid-session.
+    private func waitForOperatorSeed(_ node: CameraNode) async -> Bool {
+        calibrationAwaitingSeed = true
+        defer { calibrationAwaitingSeed = false }
+        let deadline = Date().addingTimeInterval(Self.calibrationSeedTimeout)
+        manualStatus = String(
+            format: "%@ (%d/%d): click the sphere, size the mask, Approve.",
+            manualIDKey(node), calibrationQueueIndex + 1, calibrationQueue.count)
+        log("calibrate: \(manualIDKey(node)) waiting for operator seed")
+        while !manualEndRequested, !Task.isCancelled, Date() < deadline {
+            if node.sphere.measurable {
+                log("calibrate: \(manualIDKey(node)) seed accepted")
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return node.sphere.measurable
+    }
+
     private func waitForManualCameraReady(
         _ node: CameraNode,
         after epoch: Date
@@ -1911,6 +2756,14 @@ final class ArrayController: ObservableObject {
                             finalSpreadStops: manualArraySpreadStops,
                             detail: String(format: "correction %+.3f stop", correction)
                         )
+                        // Calibrate does not record here. The hold proves the
+                        // lens stopped moving; the roll row must instead be
+                        // backed by a FRESH measurement taken after the hold,
+                        // so certification hands off to the IRE re-verification
+                        // and that gate owns both the record and the advance.
+                        if calibrateMode {
+                            requestCalibrationIREReverification(for: node, target: target)
+                        }
                     } else {
                         node.manualMatch.phase = .hold
                         node.manualMatch.detail = "verifying actual stream quality"
@@ -1922,6 +2775,7 @@ final class ArrayController: ObservableObject {
                 }
             } else {
                 invalidateManualCertificationQualityProof()
+                cancelCalibrationReverification()
                 if manualCertified.remove(node.id) != nil {
                     log("manual match: \(manualIDKey(node)) certification withdrawn before proceed")
                 }
@@ -1938,7 +2792,7 @@ final class ArrayController: ObservableObject {
         manualCommonDriftStops = nil
         updateManualArraySpread(parts)
 
-        if focusJustCertified, manualAdvanceMode == .automatic {
+        if focusJustCertified, effectiveAdvanceMode == .automatic {
             proceedManualMatch()
             return
         }
@@ -1947,11 +2801,17 @@ final class ArrayController: ObservableObject {
         case .recovering:
             manualStatus = "\(manualIDKey(focused)): HOLD - RECOVERING"
         case .matched:
-            if manualCertificationQualityTask != nil {
+            if calibrationReverifying {
+                manualStatus = "\(manualIDKey(focused)): re-verifying IRE…"
+            } else if manualCertificationQualityTask != nil {
                 manualStatus =
                     "\(manualIDKey(focused)): verifying actual livestream quality before proceed…"
+            } else if calibrateMode {
+                manualStatus = calibrationTargetSource == .establish
+                    ? "\(manualIDKey(focused)) certified at \(String(format: "%.1f", target)) IRE — pin this target, then record."
+                    : "\(manualIDKey(focused)) certified — record and move to the next body."
             } else {
-                manualStatus = manualAdvanceMode == .operatorProceed
+                manualStatus = effectiveAdvanceMode == .operatorProceed
                     ? "\(manualIDKey(focused)) certified — proceed when ready."
                     : "\(manualIDKey(focused)) certified."
             }
@@ -1960,6 +2820,12 @@ final class ArrayController: ObservableObject {
                manualCertificationQualityTask != nil {
                 manualStatus =
                     "\(manualIDKey(focused)): verifying final actual livestream quality…"
+            } else if calibrateMode {
+                manualStatus = String(
+                    format: "%@: hold steady %.1fs.",
+                    manualIDKey(focused),
+                    max(0, manualHoldSeconds * (1 - focused.manualMatch.stability))
+                )
             } else {
                 manualStatus = String(
                     format: "%d/%d certified — %@: hold steady %.1fs.",
@@ -1970,13 +2836,18 @@ final class ArrayController: ObservableObject {
                 )
             }
         case .open, .close:
-            manualStatus = String(
-                format: "%d/%d certified — %@: %@.",
-                manualMatchedCount,
-                manualParticipantCount,
-                manualIDKey(focused),
-                focused.manualMatch.detail
-            )
+            if calibrateMode {
+                manualStatus = String(format: "%@: %@.",
+                                      manualIDKey(focused), focused.manualMatch.detail)
+            } else {
+                manualStatus = String(
+                    format: "%d/%d certified — %@: %@.",
+                    manualMatchedCount,
+                    manualParticipantCount,
+                    manualIDKey(focused),
+                    focused.manualMatch.detail
+                )
+            }
         case .acquiring:
             manualStatus = "\(manualIDKey(focused)): acquiring fresh native ROI measurements…"
         case .idle, .unavailable:
@@ -2065,6 +2936,7 @@ final class ArrayController: ObservableObject {
     }
 
     private func invalidateManualCertificationQualityProof() {
+        cancelCalibrationReverification()
         guard manualCertificationQualityTask != nil
                 || manualCertificationQualityApprovedID != nil else {
             return
@@ -2145,9 +3017,10 @@ final class ArrayController: ObservableObject {
     }
 
     func manualProceedTitle(from node: CameraNode) -> String {
-        nextUncertifiedManualCamera(after: node, in: manualParticipants)
-            .map { "Proceed to \(manualIDKey($0))" }
-            ?? "Complete Calibration"
+        if let next = nextUncertifiedManualCamera(after: node, in: manualParticipants) {
+            return "Proceed to \(manualIDKey(next))"
+        }
+        return calibrateMode ? "Certify & Close" : "Complete Calibration"
     }
 
     /// Shared handoff used by both Automatic and Operator Proceed. Automatic
@@ -2158,7 +3031,7 @@ final class ArrayController: ObservableObject {
               let focused = fullScreenNode else {
             return
         }
-        if manualAdvanceMode == .operatorProceed {
+        if effectiveAdvanceMode == .operatorProceed {
             requestOperatorProceedQualityProof(for: focused)
         } else {
             advanceManualMatch(from: focused)
@@ -2240,8 +3113,11 @@ final class ArrayController: ObservableObject {
             streamRetryCount.removeValue(forKey: node.id)
             streamLastRetryAt.removeValue(forKey: node.id)
         }
-        manualStatus =
-            "All \(manualParticipantCount) cameras certified sequentially — Finish & Restore when ready."
+        manualStatus = calibrateMode
+            ? ((calibrationTargetSource == .establish && calibrationPin == nil)
+                ? "Certified and recorded. Pin this target, then Finish & Restore."
+                : "Certified and recorded — Finish & Restore, then move to the next body.")
+            : "All \(manualParticipantCount) cameras certified sequentially — Finish & Restore when ready."
         log("manual match: VERIFY PASS — every participant completed its focused \(String(format: "%.1f", manualHoldSeconds))s hold")
         soak.recordMatchEvent(
             "manual_match_verified",
